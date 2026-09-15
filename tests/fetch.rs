@@ -37,11 +37,17 @@ async fn serve_once(
             }
         }
 
-        let mut response = format!(
-            "{status_line}\r\nContent-Length: {}\r\n{extra_headers}\r\n",
-            body.len()
-        )
-        .into_bytes();
+        // An explicit Content-Length in extra_headers wins, so a HEAD
+        // response can advertise a size it does not send.
+        let mut response = if extra_headers.contains("Content-Length") {
+            format!("{status_line}\r\n{extra_headers}\r\n").into_bytes()
+        } else {
+            format!(
+                "{status_line}\r\nContent-Length: {}\r\n{extra_headers}\r\n",
+                body.len()
+            )
+            .into_bytes()
+        };
         response.extend_from_slice(body);
         sock.write_all(&response).await.unwrap();
         sock.flush().await.unwrap();
@@ -130,4 +136,28 @@ async fn a_binary_payload_still_yields_modules() {
     assert_eq!(names, vec!["driver.sys", "client.dll"]);
     // No cache validators were sent, so the embed falls back to its own note.
     assert!(snapshot.etag.is_none());
+}
+
+#[tokio::test]
+async fn probe_reports_a_live_target_without_downloading_it() {
+    // A HEAD-capable server: the probe must not pull the body.
+    let base = serve_once("HTTP/1.1 200 OK", "Content-Length: 22020096\r\n", b"").await;
+    let probe = client(&base).probe("p", "d", "win64").await.unwrap();
+
+    assert!(probe.ok());
+    assert_eq!(probe.status, 200);
+    assert_eq!(probe.platform, "win64");
+    assert!(probe.url.ends_with("/p/d/win64"));
+}
+
+#[tokio::test]
+async fn probe_returns_a_missing_target_as_a_status_not_an_error() {
+    let base = serve_once("HTTP/1.1 404 Not Found", "", b"").await;
+    let probe = client(&base)
+        .probe("wrong", "ids", "win64")
+        .await
+        .expect("a 404 is an answer, not a failure");
+
+    assert!(!probe.ok());
+    assert_eq!(probe.status, 404);
 }

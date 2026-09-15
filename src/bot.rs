@@ -5,9 +5,9 @@
 //! options. The operator supplies only a bot token.
 
 use crate::config::Game;
+use crate::embed;
 use crate::settings::{self, MIN_POLL_INTERVAL_SECS};
 use crate::tracker::Tracker;
-use crate::{eac, embed};
 use serenity::all::{
     AutocompleteChoice, ChannelType, CommandDataOption, CommandDataOptionValue, CommandInteraction,
     CommandOptionType, Context, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
@@ -316,11 +316,50 @@ impl Handler {
             Err(e) => return respond(ctx, cmd, format!("{e}")).await,
         };
 
+        // Validating means a round trip per platform, which can exceed
+        // Discord's 3s window.
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            error!(error = ?e, "failed to defer");
+            return Ok(());
+        }
+
+        let product_id = product_id.trim().to_string();
+        let deployment_id = deployment_id.trim().to_string();
+
+        // Confirm the ids are real before storing them: a wrong pair would
+        // otherwise sit in the config as a silently dead target.
+        let probes = self
+            .tracker
+            .probe_platforms(&product_id, &deployment_id, &platforms)
+            .await;
+
+        let mut live = Vec::new();
+        let mut rejected = Vec::new();
+        for (platform, probe) in platforms.iter().zip(probes) {
+            match probe {
+                Ok(p) if p.ok() => live.push((platform.clone(), p.content_length)),
+                Ok(p) => rejected.push(format!("`{platform}` — HTTP {}", p.status)),
+                Err(e) => rejected.push(format!("`{platform}` — {e:#}")),
+            }
+        }
+
+        if live.is_empty() {
+            let detail = rejected.join("\n");
+            return edit(
+                ctx,
+                cmd,
+                format!(
+                    "Nothing is published for those ids, so nothing was added:\n{detail}\n\n                     Check `product_id` and `deployment_id` against the game's                      EasyAntiCheat config, and try `platforms:win64`."
+                ),
+            )
+            .await;
+        }
+
         let game = Game {
             name: name.trim().to_string(),
-            product_id: product_id.trim().to_string(),
-            deployment_id: deployment_id.trim().to_string(),
-            platforms,
+            product_id,
+            deployment_id,
+            platforms: live.iter().map(|(p, _)| p.clone()).collect(),
         };
 
         // Seed from the config fallback so the first /eac add does not
@@ -349,29 +388,32 @@ impl Handler {
         match replaced {
             Ok(replaced) => {
                 let verb = if replaced { "Updated" } else { "Now tracking" };
-                let mut message = format!(
-                    "{verb} **{}** on {}.\n<{}>",
-                    game.name,
-                    game.platforms
-                        .iter()
-                        .map(|p| format!("`{p}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    eac::module_url_with_base(
-                        eac::CDN_BASE,
-                        &game.product_id,
-                        &game.deployment_id,
-                        &game.platforms[0]
-                    )
-                );
+                let confirmed = live
+                    .iter()
+                    .map(|(platform, size)| match size {
+                        Some(bytes) => {
+                            format!("`{platform}` ({})", embed::human_bytes(*bytes))
+                        }
+                        None => format!("`{platform}`"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let mut message = format!("{verb} **{}** — verified {confirmed}.", game.name);
+                if !rejected.is_empty() {
+                    message.push_str(&format!(
+                        "\n\nNot published, so skipped:\n{}",
+                        rejected.join("\n")
+                    ));
+                }
                 if self.announce_channel(guild_id).is_none() {
                     message.push_str("\n\nNo announce channel is set yet — run `/eac setup`.");
                 }
-                respond(ctx, cmd, message).await
+                edit(ctx, cmd, message).await
             }
             Err(e) => {
                 error!(error = ?e, "failed to save settings");
-                respond(ctx, cmd, format!("Could not save that: {e}")).await
+                edit(ctx, cmd, format!("Could not save that: {e}")).await
             }
         }
     }
@@ -705,6 +747,20 @@ fn truncate_message(body: &str, fallback: &str) -> String {
         return body.to_string();
     }
     body.chars().take(1997).collect::<String>() + "..."
+}
+
+/// Replace a deferred response.
+async fn edit(
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    content: impl Into<String>,
+) -> serenity::Result<()> {
+    cmd.edit_response(
+        &ctx.http,
+        EditInteractionResponse::new().content(truncate_message(&content.into(), "Done.")),
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn respond(

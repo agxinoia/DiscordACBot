@@ -110,6 +110,26 @@ pub fn short_hash(hash: &str) -> &str {
     &hash[..end]
 }
 
+/// Result of a cheap existence check for one target.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub url: String,
+    pub platform: String,
+    pub status: u16,
+    pub content_length: Option<u64>,
+}
+
+impl Probe {
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+/// Platform strings worth trying when the right one is unknown. `win64` is by
+/// far the most common; the rest are guesses, and a deployment only answers
+/// for the platforms it actually ships.
+pub const CANDIDATE_PLATFORMS: &[&str] = &["win64", "win32", "winarm64", "mac", "macos", "linux"];
+
 pub struct Client {
     http: reqwest::Client,
     base: String,
@@ -126,6 +146,49 @@ impl Client {
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// Check whether a target exists, without downloading it.
+    ///
+    /// Uses HEAD, falling back to a single-byte ranged GET for servers that
+    /// reject it. A non-2xx status is returned rather than raised: "this id
+    /// pair is wrong" is an answer, not a failure.
+    pub async fn probe(
+        &self,
+        product_id: &str,
+        deployment_id: &str,
+        platform: &str,
+    ) -> Result<Probe> {
+        let url = module_url_with_base(&self.base, product_id, deployment_id, platform);
+
+        let mut resp = self
+            .http
+            .head(&url)
+            .send()
+            .await
+            .with_context(|| format!("probing {url}"))?;
+
+        if matches!(resp.status().as_u16(), 405 | 501) {
+            resp = self
+                .http
+                .get(&url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()
+                .await
+                .with_context(|| format!("probing {url}"))?;
+        }
+
+        Ok(Probe {
+            content_length: resp.content_length().or_else(|| {
+                resp.headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.rsplit('/').next()?.parse().ok())
+            }),
+            status: resp.status().as_u16(),
+            url,
+            platform: platform.to_string(),
         })
     }
 

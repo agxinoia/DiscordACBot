@@ -8,6 +8,7 @@ pub mod archive;
 pub mod bot;
 pub mod config;
 pub mod diff;
+pub mod discover;
 pub mod eac;
 pub mod embed;
 pub mod settings;

@@ -82,10 +82,47 @@ that have not configured themselves. See `config.example.toml`.
 
 ### Finding product and deployment ids
 
-Both come from the game's own EasyAntiCheat configuration — typically
-`EasyAntiCheat/Settings.json` in the install directory, or the launcher's EOS
-config. The pair in `config.example.toml` is ARC Raiders' Win64 deployment,
-taken from the URL above.
+Both ids come from the game's own EasyAntiCheat configuration, shipped inside
+the install directory. The bot can find them for you:
+
+```sh
+eac-tracker discover                      # searches the usual Steam libraries
+eac-tracker discover /mnt/games --probe   # any readable path
+```
+
+`discover` walks the directory for small config files that mention
+`productid` and `deploymentid`, handling both the JSON and INI shapes, and
+prints a ready-to-paste command per game:
+
+```
+ARC Raiders
+  product_id:    9e8b37541e614575b4de303d2c2e44cf
+  deployment_id: 35e06571d8ab4de4b98519b624125459
+  source:        .../ARC Raiders/EasyAntiCheat_EOS/Settings.json
+
+  /eac add game:ARC Raiders product_id:9e8b... deployment_id:35e0... platforms:win64
+```
+
+`--probe` additionally asks the CDN which platforms each deployment actually
+publishes, which is the only reliable way to learn the platform string. Without
+it, `win64` is assumed — it is the common case but still a guess. `--json`
+emits machine-readable output, and `--depth N` bounds the search.
+
+It runs wherever the files are readable: a native Linux Steam install, a Proton
+prefix, or a Windows drive mounted on the server. Games that do not use EAC have
+no such config, and a few launchers keep it outside the install directory.
+
+Doing it by hand is a search for the key names rather than a specific file,
+since Epic has moved and renamed these:
+
+```sh
+grep -ri --include='*.json' --include='*.ini' -e deploymentid -e productid \
+  ~/.steam/steam/steamapps/common/<Game>/
+```
+
+You do not need to verify ids yourself before adding them — `/eac add` probes
+every platform you give it and refuses ids that publish nothing, reporting the
+download size for the ones that work.
 
 ## The archive
 
@@ -248,7 +285,7 @@ not. Replies are ephemeral, so configuring the bot does not clutter the channel.
 | Command | Description |
 | --- | --- |
 | `/eac setup channel:<#channel>` | Choose where updates are posted. |
-| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. `platforms` defaults to `win64` and accepts a comma separated list. |
+| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. Each platform is probed first; ones that publish nothing are rejected, not stored. `platforms` defaults to `win64`. |
 | `/eac remove game:<name>` | Stop tracking a game. |
 | `/eac list` | Games and platforms being tracked. |
 | `/eac config` | This server's current configuration. |
@@ -288,4 +325,5 @@ sighting, a published change, a no-op re-check, and state surviving a restart.
 | `src/embed.rs` | Embed rendering and attachment chunking. |
 | `src/bot.rs` | Gateway wiring and `/eac`. |
 | `src/settings.rs` | Per-server configuration set from Discord. |
+| `src/discover.rs` | Scans installed games for EAC ids. |
 | `deploy/` | systemd unit and environment file template. |

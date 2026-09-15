@@ -97,6 +97,21 @@ impl Tracker {
             .collect()
     }
 
+    /// Check which of `platforms` actually exist for an id pair, without
+    /// downloading them. Returns one probe per platform, in order.
+    pub async fn probe_platforms(
+        &self,
+        product_id: &str,
+        deployment_id: &str,
+        platforms: &[String],
+    ) -> Vec<Result<eac::Probe>> {
+        let mut results = Vec::with_capacity(platforms.len());
+        for platform in platforms {
+            results.push(self.client.probe(product_id, deployment_id, platform).await);
+        }
+        results
+    }
+
     /// Fetch one target and fold the result into persisted state.
     pub async fn check(&self, game: &Game, platform: &str) -> Result<Outcome> {
         let snapshot = self
