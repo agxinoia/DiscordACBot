@@ -164,21 +164,29 @@ refuses ones that publish nothing.
 
 ### Platform strings
 
-The platform segment is a composite naming a *combination* of targets, not one
-architecture, because a single response bundles several. Known forms:
+A deployment publishes only some platforms, and which ones varies more than you
+would expect. Measured against the live CDN:
 
-| Platform | Meaning |
-| --- | --- |
-| `wow64_win64` | Windows x64. The usual default. |
-| `winarm_x64_x64` | Windows on ARM |
-| `mac64` | macOS |
-| `linux32_64` | Linux |
+| Platform | Apex | ARC Raiders | Fortnite | Rust |
+| --- | :-: | :-: | :-: | :-: |
+| `win64` | ✓ | ✓ | ✓ | ✓ |
+| `winarm_x64_x64` | ✓ | ✓ | ✓ | ✓ |
+| `mac64` | | ✓ | ✓ | ✓ |
+| `linux32_64` | ✓ | ✓ | ✓ | |
+| `wow64_win64` | | ✓ | | |
+| `win32` | | ✓ | | |
+| `wow64` | | ✓ | | |
+| `wine64` | | | ✓ | |
+| `wine32` | | | ✓ | |
 
-Bare OS types (`win64`, `win32`, `wow64`, `wine64`, `wine32`) also appear in
-the wild, so both shapes are tried. Leave `platforms` off `/eac add` and every
-candidate is probed, keeping whichever answer — better than guessing a single
-default, since which one is right varies by deployment. `probe` with no
-platform argument does the same.
+Both shapes are real. The bare names are OS types; the composites name a
+*combination* of targets, because one response bundles several architectures.
+There is no way to predict the set from the ids, which is why `/eac add` probes
+every candidate and keeps whatever answers rather than assuming one.
+
+A 2xx alone does not prove a platform is genuinely published — a CDN can answer
+with an error document — so `--probe` reports the size of each, and flags
+anything too small to be a module.
 
 ### The built-in list
 

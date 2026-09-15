@@ -357,14 +357,20 @@ mod tests {
             source: PathBuf::new(),
             platforms: Vec::new(),
         };
+        // Every deployment measured so far publishes win64, so that is the
+        // default when probing has not narrowed it down.
         assert!(
-            finding.command().ends_with("platforms:wow64_win64"),
-            "the default is the composite Windows x64 string, got {}",
+            finding.command().ends_with("platforms:win64"),
+            "got {}",
             finding.command()
         );
 
-        finding.platforms = vec!["wow64_win64".into(), "mac64".into()];
-        assert!(finding.command().ends_with("platforms:wow64_win64, mac64"));
+        finding.platforms = vec!["win64".into(), "winarm_x64_x64".into()];
+        assert!(
+            finding
+                .command()
+                .ends_with("platforms:win64, winarm_x64_x64")
+        );
     }
 
     #[test]

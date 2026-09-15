@@ -132,20 +132,24 @@ impl Probe {
 
 /// The default platform for a Windows x64 deployment.
 ///
-/// Note this is a *composite* string, not `win64`: one response carries the
-/// modules for several architectures at once, so the path segment names the
-/// combination rather than a single target.
-pub const DEFAULT_PLATFORM: &str = "wow64_win64";
+/// Measured against the live CDN: every deployment checked so far publishes
+/// `win64`, which also matches the URL this project started from.
+pub const DEFAULT_PLATFORM: &str = "win64";
 
-/// Platform strings worth trying when the right one is unknown. The composite
-/// forms come first because they are what real deployments use; the bare OS
-/// types follow because a deployment may still answer for one.
+/// Platform strings worth trying when the right one is unknown, ordered by how
+/// often they were observed to answer.
+///
+/// A deployment publishes only some of these, and which ones varies a lot —
+/// one game answered for seven of the nine, another for three — so probing is
+/// the only way to know. Both bare OS types and composite forms are real: the
+/// composites name a *combination* of targets, because one response bundles
+/// several architectures.
 pub const CANDIDATE_PLATFORMS: &[&str] = &[
-    "wow64_win64",
+    "win64",
     "winarm_x64_x64",
     "mac64",
     "linux32_64",
-    "win64",
+    "wow64_win64",
     "win32",
     "wow64",
     "wine64",

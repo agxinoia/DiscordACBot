@@ -2,6 +2,7 @@
 //! Games CDN and posts an embed whenever a game's modules change.
 
 use anyhow::{Context, Result};
+use eac_tracker::embed::human_bytes;
 use eac_tracker::{bot, catalog, config, discover, eac, settings, tracker};
 use serenity::all::GatewayIntents;
 use std::path::PathBuf;
@@ -206,7 +207,10 @@ async fn run_discover(args: &[String]) -> Result<()> {
                     .probe(&finding.product_id, &finding.deployment_id, platform)
                     .await
                 {
-                    Ok(p) if p.ok() => finding.platforms.push(platform.clone()),
+                    Ok(p) if p.ok() => {
+                        println!("  {:<16} {}", platform, describe_size(p.content_length));
+                        finding.platforms.push(platform.clone());
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         // `{e:#}` so the cause is shown, not just the context.
@@ -399,12 +403,18 @@ async fn run_catalog(args: &[String]) -> Result<()> {
     }
 
     #[derive(serde::Serialize)]
+    struct Published {
+        platform: String,
+        bytes: Option<u64>,
+    }
+
+    #[derive(serde::Serialize)]
     struct Entry {
         name: &'static str,
         product_id: &'static str,
         deployment_id: &'static str,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        platforms: Vec<String>,
+        platforms: Vec<Published>,
     }
 
     let client = probe.then(probe_client).transpose()?;
@@ -419,7 +429,10 @@ async fn run_catalog(args: &[String]) -> Result<()> {
                     .probe(known.product_id, known.deployment_id, platform)
                     .await
                 {
-                    Ok(p) if p.ok() => platforms.push((*platform).to_string()),
+                    Ok(p) if p.ok() => platforms.push(Published {
+                        platform: (*platform).to_string(),
+                        bytes: p.content_length,
+                    }),
                     Ok(_) => {}
                     Err(e) => eprintln!("  {platform}: {e:#}"),
                 }
@@ -444,9 +457,17 @@ async fn run_catalog(args: &[String]) -> Result<()> {
         println!("  product_id:    {}", entry.product_id);
         println!("  deployment_id: {}", entry.deployment_id);
         if probe {
-            match entry.platforms.as_slice() {
-                [] => println!("  platforms:     none responded"),
-                found => println!("  platforms:     {}", found.join(", ")),
+            if entry.platforms.is_empty() {
+                println!("  platforms:     none responded");
+            } else {
+                println!("  platforms:");
+                for published in &entry.platforms {
+                    println!(
+                        "    {:<16} {}",
+                        published.platform,
+                        describe_size(published.bytes)
+                    );
+                }
             }
         }
         println!();
@@ -458,4 +479,17 @@ async fn run_catalog(args: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Render a probed size, flagging one too small to be a real module.
+///
+/// A 2xx does not by itself prove a platform is published — a CDN can answer
+/// with an error document — so the size is what distinguishes a real module
+/// from an alias that merely resolves.
+fn describe_size(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(n) if n < 4096 => format!("{} — too small to be a module", human_bytes(n)),
+        Some(n) => human_bytes(n),
+        None => "size not reported".to_string(),
+    }
 }
