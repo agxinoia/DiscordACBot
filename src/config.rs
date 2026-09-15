@@ -1,12 +1,16 @@
-//! Configuration loading.
+//! Operator-level configuration.
 //!
-//! The bot reads a TOML file (default `config.toml`, override with `EAC_CONFIG`).
-//! The Discord token is deliberately *not* required to live in that file: the
+//! This layer is entirely optional. A deployment needs only `DISCORD_TOKEN`;
+//! announce channels and tracked games are configured from Discord and live in
+//! [`crate::settings`]. A TOML file (default `config.toml`, override with
+//! `EAC_CONFIG`) can still supply paths, timeouts and per-guild fallbacks.
+//!
+//! The token is deliberately not required to live in that file: the
 //! `DISCORD_TOKEN` environment variable takes precedence so the config can be
 //! committed or shared without leaking credentials.
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -23,8 +27,10 @@ pub struct Discord {
     /// Optional. `DISCORD_TOKEN` wins when both are set.
     #[serde(default)]
     pub token: Option<String>,
-    /// Channel that update embeds are posted to.
-    pub channel_id: u64,
+    /// Fallback announce channel for guilds that have not set their own with
+    /// `/eac setup`. Optional: the normal path is to configure it in Discord.
+    #[serde(default)]
+    pub channel_id: Option<u64>,
     /// Register the `/eac` slash command to this guild only. Guild-scoped
     /// commands appear instantly; global ones can take an hour to propagate.
     #[serde(default)]
@@ -50,6 +56,9 @@ pub struct Tracker {
     pub max_attachment_bytes: u64,
     #[serde(default = "defaults::state_path")]
     pub state_path: String,
+    /// Where guild configuration set through `/eac` is persisted.
+    #[serde(default = "defaults::settings_path")]
+    pub settings_path: String,
     #[serde(default = "defaults::user_agent")]
     pub user_agent: String,
     /// Thumbnail shown on the embed. Empty string disables it.
@@ -66,7 +75,7 @@ pub struct Tracker {
     pub archive_path: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Game {
     pub name: String,
     pub product_id: String,
@@ -95,6 +104,9 @@ mod defaults {
     pub fn archive_path() -> String {
         "archive".to_string()
     }
+    pub fn settings_path() -> String {
+        "settings.json".to_string()
+    }
     pub fn user_agent() -> String {
         concat!("eac-tracker/", env!("CARGO_PKG_VERSION")).to_string()
     }
@@ -109,6 +121,7 @@ impl Default for Tracker {
             attach_raw_response: defaults::attach_raw_response(),
             max_attachment_bytes: defaults::max_attachment_bytes(),
             state_path: defaults::state_path(),
+            settings_path: defaults::settings_path(),
             user_agent: defaults::user_agent(),
             thumbnail_url: None,
             cdn_base: None,
@@ -118,14 +131,48 @@ impl Default for Tracker {
 }
 
 impl Config {
+    /// Load from `path`, or fall back to defaults when the file is absent.
+    /// Only the bot token is required, and it normally comes from the
+    /// environment, so a deployment need not have a config file at all.
+    pub fn load_or_default(path: &Path) -> Result<Self> {
+        if path.exists() {
+            return Self::load(path);
+        }
+        let mut cfg = Config {
+            discord: Discord {
+                token: None,
+                channel_id: None,
+                guild_id: None,
+            },
+            tracker: Tracker::default(),
+            games: Vec::new(),
+        };
+        cfg.apply_environment();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn apply_environment(&mut self) {
+        if let Ok(token) = std::env::var("DISCORD_TOKEN")
+            && !token.trim().is_empty()
+        {
+            self.discord.token = Some(token);
+        }
+        if let Ok(guild) = std::env::var("DISCORD_GUILD_ID")
+            && let Ok(parsed) = guild.trim().parse::<u64>()
+        {
+            self.discord.guild_id = Some(parsed);
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         // Report an absolute path: under systemd the relative default resolves
         // against WorkingDirectory, not wherever the operator was standing.
         let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let raw = std::fs::read_to_string(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => anyhow!(
-                "no config at {} — copy config.example.toml there, \
-                 then set discord.channel_id and your games",
+                "no config at {} — a config file is optional, so either remove \
+                 EAC_CONFIG or create the file",
                 shown.display()
             ),
             _ => anyhow::Error::new(e).context(format!("reading config at {}", shown.display())),
@@ -133,11 +180,7 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&raw).with_context(|| format!("parsing {}", shown.display()))?;
 
-        if let Ok(token) = std::env::var("DISCORD_TOKEN")
-            && !token.trim().is_empty()
-        {
-            cfg.discord.token = Some(token);
-        }
+        cfg.apply_environment();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -151,13 +194,13 @@ impl Config {
             .trim()
             .is_empty()
         {
-            bail!("no Discord token: set DISCORD_TOKEN or discord.token in the config");
+            bail!(
+                "no Discord token: set the DISCORD_TOKEN environment variable \
+                 (or discord.token in a config file)"
+            );
         }
-        if self.discord.channel_id == 0 {
-            bail!("discord.channel_id must be set");
-        }
-        if self.games.is_empty() {
-            bail!("no [[games]] configured — nothing to track");
+        if self.discord.channel_id == Some(0) {
+            bail!("discord.channel_id is not a valid channel id");
         }
         for game in &self.games {
             if game.platforms.is_empty() {
@@ -217,7 +260,11 @@ platforms = ["win64"]
     fn the_shipped_example_config_is_valid() {
         let raw = include_str!("../config.example.toml");
         let cfg: Config = toml::from_str(raw).expect("example config must parse");
-        assert!(!cfg.games.is_empty(), "example must configure a game");
+        // The example ships with no games and no channel: both are configured
+        // from Discord. It must still be a valid file.
+        assert!(cfg.games.is_empty());
+        assert!(cfg.discord.channel_id.is_none());
+        assert_eq!(cfg.tracker.settings_path, "settings.json");
     }
 
     #[test]
@@ -232,20 +279,32 @@ platforms = ["win64"]
         assert!(err.contains('/'), "path must be absolute, got: {err}");
         assert!(err.contains("definitely-not-here.toml"), "got: {err}");
         assert!(
-            err.contains("config.example.toml"),
-            "must say how to fix it: {err}"
+            err.contains("optional"),
+            "must say a config file is not required: {err}"
         );
     }
 
     #[test]
-    fn rejects_a_config_with_no_games() {
-        let src = VALID.split("[[games]]").next().unwrap().to_string();
-        assert!(
-            parse(&src)
-                .unwrap_err()
-                .to_string()
-                .contains("no [[games]]")
-        );
+    fn a_token_is_the_only_requirement() {
+        // Channels and games are configured from Discord, so a config with
+        // neither is valid — that is the normal deployment now.
+        let cfg = parse("[discord]\ntoken = \"t\"\n").unwrap();
+        assert!(cfg.games.is_empty());
+        assert!(cfg.discord.channel_id.is_none());
+    }
+
+    #[test]
+    fn a_config_file_is_optional_entirely() {
+        // Reaching the token check proves the absent file was not itself
+        // treated as an error.
+        match Config::load_or_default(Path::new("no-such-config.toml")) {
+            Err(e) => assert!(
+                e.to_string().contains("token"),
+                "absent file must not be the error: {e}"
+            ),
+            // A token in the environment is equally valid.
+            Ok(cfg) => assert!(cfg.discord.token.is_some()),
+        }
     }
 
     #[test]

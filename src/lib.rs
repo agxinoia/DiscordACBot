@@ -10,5 +10,6 @@ pub mod config;
 pub mod diff;
 pub mod eac;
 pub mod embed;
+pub mod settings;
 pub mod state;
 pub mod tracker;

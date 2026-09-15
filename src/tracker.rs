@@ -6,6 +6,7 @@ use crate::config::{Config, Game};
 use crate::diff::{self, Diff};
 use crate::eac::{self, Snapshot};
 use crate::embed;
+use crate::settings::{self, SettingsStore, Subscriber};
 use crate::state::{Seen, Store, now_unix, target_key};
 use anyhow::{Context, Result};
 use serenity::builder::{CreateAttachment, CreateMessage};
@@ -41,12 +42,13 @@ pub struct Tracker {
     config: Arc<Config>,
     client: eac::Client,
     store: Mutex<Store>,
+    settings: Arc<SettingsStore>,
     /// `None` when archiving is switched off, which also costs TLSH distance.
     archive: Option<Archive>,
 }
 
 impl Tracker {
-    pub fn new(config: Arc<Config>) -> Result<Self> {
+    pub fn new(config: Arc<Config>, settings: Arc<SettingsStore>) -> Result<Self> {
         let client = eac::Client::with_base(
             config.tracker.cdn_base.as_deref().unwrap_or(eac::CDN_BASE),
             &config.tracker.user_agent,
@@ -60,8 +62,18 @@ impl Tracker {
             config,
             client,
             store: Mutex::new(store),
+            settings,
             archive,
         })
+    }
+
+    pub fn settings(&self) -> &Arc<SettingsStore> {
+        &self.settings
+    }
+
+    /// Everything currently worth polling, folded across all guilds.
+    pub fn targets(&self) -> Vec<settings::Target> {
+        settings::targets(&self.settings.snapshot(), &self.config)
     }
 
     pub fn config(&self) -> &Config {
@@ -175,65 +187,82 @@ impl Tracker {
         }
     }
 
-    /// Check every configured target once, announcing the ones that moved.
+    /// Check every tracked target once, announcing the ones that moved.
+    ///
+    /// Guilds tracking the same product, deployment and platform share a
+    /// single fetch; only the announcement fans out.
     pub async fn run_once(&self, http: &Http) {
-        for game in &self.config.games {
-            for platform in &game.platforms {
-                match self.check(game, platform).await {
-                    Ok(outcome) => {
-                        if outcome.should_announce(self.config.tracker.announce_on_first_seen) {
-                            info!(
-                                game = %game.name,
-                                platform = %platform,
-                                digest = %outcome.snapshot.short_digest(),
-                                first_seen = outcome.first_seen,
-                                "announcing EAC module change"
+        for target in self.targets() {
+            match self.check(&target.game, &target.platform).await {
+                Ok(outcome) => {
+                    for subscriber in &target.subscribers {
+                        if !outcome.should_announce(subscriber.announce_on_first_seen) {
+                            continue;
+                        }
+                        info!(
+                            game = %target.game.name,
+                            platform = %target.platform,
+                            guild = subscriber.guild_id,
+                            digest = %outcome.snapshot.short_digest(),
+                            first_seen = outcome.first_seen,
+                            "announcing EAC module change"
+                        );
+                        if let Err(e) = self
+                            .announce(http, subscriber, &target.game, &target.platform, &outcome)
+                            .await
+                        {
+                            // One guild's misconfigured channel must not stop
+                            // the others from being told.
+                            error!(
+                                game = %target.game.name,
+                                guild = subscriber.guild_id,
+                                error = ?e,
+                                "failed to post update"
                             );
-                            if let Err(e) = self.announce(http, game, platform, &outcome).await {
-                                error!(game = %game.name, platform = %platform, error = ?e,
-                                       "failed to post update");
-                            }
                         }
                     }
-                    Err(e) => {
-                        // One unreachable target must not stall the others.
-                        warn!(game = %game.name, platform = %platform, error = ?e,
-                              "check failed");
-                    }
+                }
+                Err(e) => {
+                    // One unreachable target must not stall the others.
+                    warn!(game = %target.game.name, platform = %target.platform, error = ?e,
+                          "check failed");
                 }
             }
         }
     }
 
-    /// Poll forever on the configured interval.
+    /// Poll forever, re-reading the interval each cycle so `/eac set` takes
+    /// effect without a restart.
     pub async fn poll_loop(self: Arc<Self>, http: Arc<Http>) {
-        let interval = Duration::from_secs(self.config.tracker.poll_interval_secs);
         info!(
-            interval_secs = self.config.tracker.poll_interval_secs,
+            interval_secs = self.poll_interval(),
             targets = self.target_count(),
             "starting poll loop"
         );
-        let mut ticker = tokio::time::interval(interval);
-        // A missed tick (slow cycle) should not cause a burst of catch-up runs.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::time::sleep(Duration::from_secs(self.poll_interval())).await;
             self.run_once(&http).await;
         }
     }
 
+    pub fn poll_interval(&self) -> u64 {
+        settings::poll_interval(&self.settings.snapshot(), &self.config)
+    }
+
     pub fn target_count(&self) -> usize {
-        self.config.games.iter().map(|g| g.platforms.len()).sum()
+        self.targets().len()
     }
 
     async fn announce(
         &self,
         http: &Http,
+        subscriber: &Subscriber,
         game: &Game,
         platform: &str,
         outcome: &Outcome,
     ) -> Result<()> {
         let tracker = &self.config.tracker;
+        let attach_raw = subscriber.attach_raw_response;
         let embed = embed::build_update_embed(
             game,
             platform,
@@ -241,13 +270,13 @@ impl Tracker {
             outcome.previous.as_deref(),
             outcome.diff.as_ref(),
             tracker.max_attachment_bytes,
-            tracker.attach_raw_response,
+            attach_raw,
             tracker.thumbnail_url.as_deref(),
         );
 
         let mut message = CreateMessage::new().embed(embed);
 
-        if tracker.attach_raw_response {
+        if attach_raw {
             let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
             if parts.len() > MAX_ATTACHMENTS {
                 warn!(
@@ -262,7 +291,7 @@ impl Tracker {
             }
         }
 
-        ChannelId::new(self.config.discord.channel_id)
+        ChannelId::new(subscriber.channel_id)
             .send_message(http, message)
             .await
             .context("sending update message")?;

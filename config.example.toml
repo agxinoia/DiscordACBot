@@ -1,40 +1,41 @@
-# Copy to config.toml and fill in. `EAC_CONFIG` overrides the path.
+# This file is OPTIONAL. The bot needs only the DISCORD_TOKEN environment
+# variable; the announce channel and tracked games are configured from Discord
+# with /eac. Use this file only to change operator-level defaults.
 
 [discord]
 # Prefer the DISCORD_TOKEN environment variable over putting the token here.
 # token = "..."
-channel_id = 123456789012345678  # replace with your channel id
-# Register /eac to one guild for instant availability. Omit to register it
-# globally, which can take up to an hour to propagate.
+#
+# Register /eac to one guild for instant availability instead of globally,
+# which can take up to an hour to propagate. Also settable as DISCORD_GUILD_ID.
 # guild_id = 123456789012345678
+#
+# Fallback announce channel for guilds that have not run /eac setup.
+# Normally unnecessary — set it in Discord instead.
+# channel_id = 123456789012345678
 
 [tracker]
+# Default sweep interval. Changeable at runtime with /eac set poll_interval_secs.
 poll_interval_secs = 300
 request_timeout_secs = 30
-# Post an embed the first time a target is seen. Leave false so a fresh
-# deployment does not fire one embed per configured target on startup.
+# Per-guild defaults, overridable with /eac set.
 announce_on_first_seen = false
-# Attach the raw CDN response, split into parts under the size below.
 attach_raw_response = true
 max_attachment_bytes = 9500000
+# Where the bot keeps its own files, relative to the working directory.
 state_path = "state.json"
-# Directory for the payload archive: every distinct payload is kept under its
-# SHA-256, with an append-only index.jsonl describing each fetch. Set to "" to
-# disable, which also disables TLSH distance in update embeds, since measuring
-# how far a build moved needs the previous payload's bytes.
+settings_path = "settings.json"
+# Every distinct payload is kept under its SHA-256, with an append-only
+# index.jsonl describing each fetch. Set to "" to disable, which also disables
+# TLSH distance in update embeds, since measuring how far a build moved needs
+# the previous payload's bytes.
 archive_path = "archive"
 # thumbnail_url = "https://example.invalid/eac-logo.png"
 
-# Product and deployment ids come from the game's EasyAntiCheat settings;
-# the URL is https://modules-cdn.eac-prod.on.epicgames.com/modules/{product_id}/{deployment_id}/{platform}
-[[games]]
-name = "ARC Raiders"
-product_id = "9e8b37541e614575b4de303d2c2e44cf"
-deployment_id = "35e06571d8ab4de4b98519b624125459"
-platforms = ["win64"]
-
+# Games listed here act as a fallback for guilds that have not added any with
+# /eac add. The normal path is to add them in Discord.
 # [[games]]
-# name = "Rust"
-# product_id = "..."
-# deployment_id = "..."
-# platforms = ["win64", "win32"]
+# name = "ARC Raiders"
+# product_id = "9e8b37541e614575b4de303d2c2e44cf"
+# deployment_id = "35e06571d8ab4de4b98519b624125459"
+# platforms = ["win64"]

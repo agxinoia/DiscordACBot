@@ -3,6 +3,7 @@
 
 use eac_tracker::archive::Archive;
 use eac_tracker::config::{Config, Discord, Game, Tracker as TrackerCfg};
+use eac_tracker::settings::SettingsStore;
 use eac_tracker::tracker::Tracker;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -77,7 +78,7 @@ fn config_with_archive(base: &str, state_path: &str, archive_path: &str) -> Arc<
     Arc::new(Config {
         discord: Discord {
             token: Some("test".into()),
-            channel_id: 1,
+            channel_id: Some(1),
             guild_id: None,
         },
         tracker: TrackerCfg {
@@ -90,6 +91,14 @@ fn config_with_archive(base: &str, state_path: &str, archive_path: &str) -> Arc<
     })
 }
 
+/// Build a tracker with its own scratch settings store.
+fn tracker_for(cfg: Arc<Config>) -> (Tracker, Arc<SettingsStore>) {
+    let path = format!("{}.settings", cfg.tracker.state_path);
+    let store = Arc::new(SettingsStore::load(std::path::Path::new(&path)).unwrap());
+    let tracker = Tracker::new(cfg, Arc::clone(&store)).unwrap();
+    (tracker, store)
+}
+
 fn temp_state(name: &str) -> String {
     let mut p = std::env::temp_dir();
     p.push(format!(
@@ -99,6 +108,7 @@ fn temp_state(name: &str) -> String {
     ));
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_dir_all(format!("{}.archive", p.to_string_lossy()));
+    let _ = std::fs::remove_file(format!("{}.settings", p.to_string_lossy()));
     p.to_string_lossy().into_owned()
 }
 
@@ -106,6 +116,7 @@ fn temp_state(name: &str) -> String {
 fn cleanup(state_path: &str) {
     let _ = std::fs::remove_file(state_path);
     let _ = std::fs::remove_dir_all(format!("{state_path}.archive"));
+    let _ = std::fs::remove_file(format!("{state_path}.settings"));
 }
 
 #[tokio::test]
@@ -117,7 +128,7 @@ async fn detects_a_change_exactly_once_and_remembers_it_across_restarts() {
     let state_path = temp_state("cycle");
     let cfg = config(&cdn.base, &state_path);
 
-    let tracker = Tracker::new(Arc::clone(&cfg)).unwrap();
+    let (tracker, _settings) = tracker_for(Arc::clone(&cfg));
     let game = game();
 
     // First sighting: recorded, but not a change.
@@ -149,7 +160,7 @@ async fn detects_a_change_exactly_once_and_remembers_it_across_restarts() {
 
     // A fresh process (new Tracker over the same state file) stays quiet.
     drop(tracker);
-    let restarted = Tracker::new(cfg).unwrap();
+    let (restarted, _) = tracker_for(cfg);
     let after_restart = restarted.check(&game, "win64").await.unwrap();
     assert!(
         !after_restart.first_seen,
@@ -167,7 +178,9 @@ async fn counts_every_configured_platform_as_a_target() {
     let mut cfg = config(&cdn.base, &state_path);
     Arc::get_mut(&mut cfg).unwrap().games[0].platforms = vec!["win64".into(), "win32".into()];
 
-    let tracker = Tracker::new(cfg).unwrap();
+    let (tracker, settings) = tracker_for(cfg);
+    // A guild with no overrides inherits the operator's configured games.
+    settings.edit_guild(1, |_| {}).unwrap();
     assert_eq!(tracker.target_count(), 2);
 
     cleanup(&state_path);
@@ -177,7 +190,7 @@ async fn counts_every_configured_platform_as_a_target() {
 async fn status_lines_report_seen_targets() {
     let cdn = FakeCdn::start(b"payload").await;
     let state_path = temp_state("status");
-    let tracker = Tracker::new(config(&cdn.base, &state_path)).unwrap();
+    let (tracker, _settings) = tracker_for(config(&cdn.base, &state_path));
 
     assert!(tracker.status_lines().is_empty(), "nothing seen yet");
     tracker.check(&game(), "win64").await.unwrap();
@@ -204,7 +217,7 @@ async fn archives_every_payload_and_describes_what_changed() {
     let state_path = temp_state("archive");
     let archive_path = format!("{state_path}.archive");
     let cfg = config_with_archive(&cdn.base, &state_path, &archive_path);
-    let tracker = Tracker::new(Arc::clone(&cfg)).unwrap();
+    let (tracker, _settings) = tracker_for(Arc::clone(&cfg));
     let game = game();
 
     let first = tracker.check(&game, "win64").await.unwrap();
@@ -266,7 +279,7 @@ async fn archiving_can_be_switched_off() {
     let cdn = FakeCdn::start(b"payload").await;
     let state_path = temp_state("noarchive");
     let cfg = config_with_archive(&cdn.base, &state_path, "");
-    let tracker = Tracker::new(cfg).unwrap();
+    let (tracker, _settings) = tracker_for(cfg);
 
     // Must not create a directory, and must not fail the check.
     tracker.check(&game(), "win64").await.unwrap();

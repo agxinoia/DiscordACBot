@@ -2,7 +2,7 @@
 //! Games CDN and posts an embed whenever a game's modules change.
 
 use anyhow::{Context, Result};
-use eac_tracker::{bot, config, tracker};
+use eac_tracker::{bot, config, settings, tracker};
 use serenity::all::GatewayIntents;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,10 +21,22 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("config.toml"));
 
-    let config = Arc::new(config::Config::load(&config_path)?);
-    info!(config = %config_path.display(), games = config.games.len(), "loaded configuration");
+    // A config file is optional: the token alone is enough to start, and
+    // channels and games are configured from Discord with /eac.
+    let config = Arc::new(config::Config::load_or_default(&config_path)?);
+    info!(
+        config = %config_path.display(),
+        present = config_path.exists(),
+        "loaded configuration"
+    );
 
-    let tracker = Arc::new(tracker::Tracker::new(Arc::clone(&config))?);
+    let settings = Arc::new(settings::SettingsStore::load(std::path::Path::new(
+        &config.tracker.settings_path,
+    ))?);
+    let tracker = Arc::new(tracker::Tracker::new(
+        Arc::clone(&config),
+        Arc::clone(&settings),
+    )?);
 
     // Posting embeds and running slash commands need no privileged intents.
     let mut client = serenity::Client::builder(config.token(), GatewayIntents::empty())

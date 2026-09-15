@@ -52,18 +52,33 @@ learn the real schema, `src/eac.rs` is the only file that needs to change.
 2. Invite it with the `bot` and `applications.commands` scopes and the
    **Send Messages**, **Embed Links** and **Attach Files** permissions. No
    privileged intents are required.
-3. Configure and run:
+3. Run it. The token is the only thing you need to supply:
 
 ```sh
-cp config.example.toml config.toml
-nano config.toml               # set discord.channel_id and your games
-export DISCORD_TOKEN=...       # preferred over putting the token in the file
+export DISCORD_TOKEN=...
 cargo run --release
 ```
 
-`EAC_CONFIG` overrides the config path; `EAC_LOG` takes a
-[tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
-such as `EAC_LOG=debug`.
+4. In your server, configure it with slash commands:
+
+```
+/eac setup channel:#eac-updates
+/eac add game:ARC Raiders
+        product_id:9e8b37541e614575b4de303d2c2e44cf
+        deployment_id:35e06571d8ab4de4b98519b624125459
+        platforms:win64
+```
+
+That is the whole setup. Settings are stored per server in `settings.json`, so
+one bot can serve several servers without their configuration colliding.
+
+`/eac` registers globally by default, which can take up to an hour to appear.
+For instant availability while setting up, set `DISCORD_GUILD_ID` to your
+server's id and the command registers to that server only.
+
+There is no config file in the normal case. `config.toml` is optional and only
+changes operator-level defaults — paths, timeouts, and fallbacks for servers
+that have not configured themselves. See `config.example.toml`.
 
 ### Finding product and deployment ids
 
@@ -152,23 +167,13 @@ cd DiscordBot
 cargo build --release
 ```
 
-Create the config, if you have not already. The service will not start
-without it, so do this before installing the unit:
-
-```sh
-cp config.example.toml config.toml
-nano config.toml               # set discord.channel_id and your games
-```
-
-Then install the binary, config and credentials:
+Install the binary and the token. No config file is needed:
 
 ```sh
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin eac-tracker
 sudo install -d -o eac-tracker -g eac-tracker /opt/eac-tracker
 sudo install -o eac-tracker -g eac-tracker -m 755 \
     target/release/eac-tracker /opt/eac-tracker/
-sudo install -o eac-tracker -g eac-tracker -m 644 \
-    config.toml /opt/eac-tracker/
 
 sudo install -m 600 deploy/eac-tracker.env.example /etc/eac-tracker.env
 sudo nano /etc/eac-tracker.env           # set DISCORD_TOKEN
@@ -193,11 +198,9 @@ The unit runs as an unprivileged system user under `ProtectSystem=strict`.
 remove that line and the bot cannot persist digests. If you move
 `tracker.state_path` elsewhere, add that path to `ReadWritePaths` too.
 
-If the service crash-loops with `no config at /opt/eac-tracker/config.toml`,
-the config was never installed — run the two blocks above, then
-`sudo systemctl restart eac-tracker`. Paths in the log are absolute, and under
-this unit they resolve against `WorkingDirectory=/opt/eac-tracker`, not the
-directory you built in.
+Once it is running, configure it from Discord with `/eac setup` and `/eac add`.
+The bot writes `settings.json`, `state.json` and `archive/` into
+`/opt/eac-tracker`, which is what `ReadWritePaths` in the unit permits.
 
 Two things to expect on a first run:
 
@@ -205,24 +208,30 @@ Two things to expect on a first run:
   from the `ready` event, so a bad token shows up as reconnect warnings with no
   `state.json` appearing.
 - **Nothing is posted on the first sweep**, because `announce_on_first_seen`
-  defaults to false. Set it true temporarily to confirm the embed renders
-  without waiting for a real EAC update.
+  defaults to false — the first pass records baselines. To confirm the embed
+  renders without waiting for a real EAC update, run `/eac check`, or
+  `/eac set option:announce_on_first_seen value:true`.
 
 If you build on one machine and copy the binary to another, the target needs a
 glibc at least as new as the build host's. Building on the target avoids it.
 
 ## Configuration
 
+Everything below is optional and lives in `config.toml`. Per-server settings
+(`/eac setup`, `/eac add`, `/eac set`) override these and are stored separately
+in `settings.path`; the values here apply to servers that have not set their own.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `discord.channel_id` | — | Channel that update embeds are posted to. |
 | `discord.token` | — | Overridden by `DISCORD_TOKEN`. Prefer the env var. |
-| `discord.guild_id` | unset | Register `/eac` to one guild (instant) instead of globally (up to an hour). |
+| `discord.guild_id` | unset | Register `/eac` to one guild (instant) instead of globally (up to an hour). Also `DISCORD_GUILD_ID`. |
+| `discord.channel_id` | unset | Fallback announce channel for servers that have not run `/eac setup`. |
 | `tracker.poll_interval_secs` | `300` | Seconds between sweeps. Minimum 30. |
 | `tracker.announce_on_first_seen` | `false` | Post an embed the first time a target is seen. Leave off so a fresh deployment does not fire one embed per target on startup. |
 | `tracker.attach_raw_response` | `true` | Attach the raw CDN response to the embed. |
 | `tracker.max_attachment_bytes` | `9500000` | Upload chunk size, just under Discord's 10 MB per-file limit. Bodies larger than this are split into numbered parts (max 10 per message). |
 | `tracker.state_path` | `state.json` | Where last-seen digests are persisted. |
+| `tracker.settings_path` | `settings.json` | Where per-server configuration from `/eac` is persisted. |
 | `tracker.archive_path` | `archive` | Payload archive directory. `""` disables it, which also disables TLSH distance. |
 | `tracker.thumbnail_url` | unset | Image shown in the embed's corner. |
 | `tracker.cdn_base` | official CDN | Override for mirrors and testing. |
@@ -233,15 +242,26 @@ every tracked module.
 
 ## Commands
 
+Changing configuration requires the **Manage Server** permission; reading does
+not. Replies are ephemeral, so configuring the bot does not clutter the channel.
+
 | Command | Description |
 | --- | --- |
+| `/eac setup channel:<#channel>` | Choose where updates are posted. |
+| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. `platforms` defaults to `win64` and accepts a comma separated list. |
+| `/eac remove game:<name>` | Stop tracking a game. |
 | `/eac list` | Games and platforms being tracked. |
+| `/eac config` | This server's current configuration. |
 | `/eac status` | Last seen hash, size and time per target. |
-| `/eac check <game> [platform]` | Fetch now and report current state, changed or not. Game name autocompletes. |
+| `/eac check game:<name> [platform]` | Fetch now and report current state, changed or not. |
+| `/eac set option:<option> value:<value>` | Change `announce_on_first_seen`, `attach_raw_response` or `poll_interval_secs`. |
 
-`/eac check` reaches out to the CDN on demand and is available to everyone in
-the guild by default. If that matters for your server, restrict the command
-under **Server Settings → Integrations**.
+Game names autocomplete. `poll_interval_secs` applies to the whole bot rather
+than one server, has a 30-second floor, and takes effect without a restart.
+
+Values passed to `/eac add` are validated before they are stored: product and
+deployment ids must be alphanumeric, because they are interpolated straight
+into a CDN URL.
 
 ## Development
 
@@ -267,4 +287,5 @@ sighting, a published change, a no-op re-check, and state surviving a restart.
 | `src/tracker.rs` | Poll loop, change detection, posting. |
 | `src/embed.rs` | Embed rendering and attachment chunking. |
 | `src/bot.rs` | Gateway wiring and `/eac`. |
+| `src/settings.rs` | Per-server configuration set from Discord. |
 | `deploy/` | systemd unit and environment file template. |
