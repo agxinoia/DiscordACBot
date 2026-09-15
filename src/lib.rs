@@ -6,6 +6,7 @@
 pub mod analysis;
 pub mod archive;
 pub mod bot;
+pub mod catalog;
 pub mod config;
 pub mod diff;
 pub mod discover;

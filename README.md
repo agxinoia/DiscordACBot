@@ -168,10 +168,23 @@ candidate is probed, keeping whichever answer — better than guessing a single
 default, since which one is right varies by deployment. `probe` with no
 platform argument does the same.
 
-### Known deployments
+### The built-in list
 
-Published by others and **not verified against the CDN by this project** —
-`probe` them before trusting them, since deployments get rotated:
+A small catalogue of known deployments ships with the bot, so common games need
+no ids at all:
+
+```
+/eac browse
+```
+
+gives a pick list — tick any number and they are added together. Each is probed
+first, and anything that publishes nothing is skipped rather than stored, so the
+list being stale costs you nothing. Games already tracked are left out of the
+offer, matched by id rather than name so a locally renamed game is not offered
+twice.
+
+`/eac add game:Rust` works too: when a name matches the catalogue, the ids are
+filled in for you.
 
 | Game | product_id | deployment_id |
 | --- | --- | --- |
@@ -179,6 +192,16 @@ Published by others and **not verified against the CDN by this project** —
 | Rust | `429c2212ad284866aee071454c2125b5` | `76796531e86443548754600511f42e9e` |
 | Apex Legends | `5dcd88f4e2094a698ebffa43438edc33` | `47a5a1b2e0f64748a96777920ad97fbd` |
 | Fortnite | `prod-fn` | `62a9473a2dca46b29ccf17577fcf42d7` |
+
+These come from published research and are **not verified against the CDN by
+this project**. Check them from the command line, where the CDN is reachable:
+
+```sh
+eac-tracker catalog --probe
+```
+
+Deployments get rotated, so entries going stale is expected. Add one to
+`src/catalog.rs` to extend the list.
 
 Note Fortnite's product id is not a hex string — ids are opaque, so anything
 that is not a path separator is accepted.
@@ -355,7 +378,8 @@ not. Replies are ephemeral, so configuring the bot does not clutter the channel.
 | Command | Description |
 | --- | --- |
 | `/eac setup channel:<#channel>` | Choose where updates are posted. |
-| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. Each platform is probed first; ones that publish nothing are rejected, not stored. Omit `platforms` to detect them automatically. |
+| `/eac browse` | Pick from the built-in list of known games. |
+| `/eac add game:<name> [product_id:<id> deployment_id:<id>] [platforms:<list>]` | Track a game. Ids may be omitted for a game in the built-in list. Each platform is probed first; ones that publish nothing are rejected, not stored. Omit `platforms` to detect them automatically. |
 | `/eac remove game:<name>` | Stop tracking a game. |
 | `/eac list` | Games and platforms being tracked. |
 | `/eac config` | This server's current configuration. |
@@ -396,4 +420,5 @@ sighting, a published change, a no-op re-check, and state surviving a restart.
 | `src/bot.rs` | Gateway wiring and `/eac`. |
 | `src/settings.rs` | Per-server configuration set from Discord. |
 | `src/discover.rs` | Scans installed games for EAC ids. |
+| `src/catalog.rs` | Built-in list of known deployments. |
 | `deploy/` | systemd unit and environment file template. |

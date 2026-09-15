@@ -4,6 +4,7 @@
 //! announce channel, which games to track, and the per-guild announcement
 //! options. The operator supplies only a bot token.
 
+use crate::catalog;
 use crate::config::Game;
 use crate::eac;
 use crate::embed;
@@ -11,9 +12,11 @@ use crate::settings::{self, MIN_POLL_INTERVAL_SECS};
 use crate::tracker::Tracker;
 use serenity::all::{
     AutocompleteChoice, ChannelType, CommandDataOption, CommandDataOptionValue, CommandInteraction,
-    CommandOptionType, Context, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-    EventHandler, GuildId, Interaction, Permissions, Ready,
+    CommandOptionType, ComponentInteraction, ComponentInteractionDataKind, Context,
+    CreateAutocompleteResponse, CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, EditInteractionResponse, EventHandler, GuildId, Interaction,
+    Permissions, Ready,
 };
 use serenity::async_trait;
 use serenity::builder::CreateEmbed;
@@ -36,6 +39,58 @@ const SETTABLE: &[(&str, &str)] = &[
         "Seconds between sweeps (minimum 30, applies bot-wide)",
     ),
 ];
+
+/// custom_id of the catalogue pick list.
+const SELECT_KNOWN: &str = "eac:known";
+
+/// Result of storing one game.
+struct AddOutcome {
+    game: Game,
+    replaced: bool,
+    /// Platforms that answered, with their download size.
+    live: Vec<(String, Option<u64>)>,
+    /// Platforms that did not, with why.
+    rejected: Vec<String>,
+}
+
+impl AddOutcome {
+    /// One line per game. `show_rejected` is false when platforms were being
+    /// detected, since most candidates not matching is the expected outcome
+    /// rather than something the reader needs told about.
+    fn describe(&self, show_rejected: bool) -> String {
+        let verb = if self.replaced {
+            "Updated"
+        } else {
+            "Now tracking"
+        };
+        let confirmed = self
+            .live
+            .iter()
+            .map(|(platform, size)| match size {
+                Some(bytes) => format!("`{platform}` ({})", embed::human_bytes(*bytes)),
+                None => format!("`{platform}`"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut message = format!("{verb} **{}** — verified {confirmed}.", self.game.name);
+        if show_rejected && !self.rejected.is_empty() {
+            message.push_str(&format!(
+                "\n\nNot published, so skipped:\n{}",
+                self.rejected.join("\n")
+            ));
+        }
+        message
+    }
+}
+
+/// Shorten an id for a select-menu description, which is tight on space.
+fn truncate_id(id: &str) -> String {
+    match id.char_indices().nth(12) {
+        Some((cut, _)) => format!("{}…", &id[..cut]),
+        None => id.to_string(),
+    }
+}
 
 pub struct Handler {
     tracker: Arc<Tracker>,
@@ -85,24 +140,28 @@ impl Handler {
                     "Track a game's EAC modules",
                 )
                 .add_sub_option(
-                    CreateCommandOption::new(CommandOptionType::String, "game", "Display name")
-                        .required(true),
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "game",
+                        "Display name, or a name from /eac browse",
+                    )
+                    .required(true),
                 )
                 .add_sub_option(
                     CreateCommandOption::new(
                         CommandOptionType::String,
                         "product_id",
-                        "EAC product id from the game's EasyAntiCheat settings",
+                        "EAC product id — omit for a game in the built-in list",
                     )
-                    .required(true),
+                    .required(false),
                 )
                 .add_sub_option(
                     CreateCommandOption::new(
                         CommandOptionType::String,
                         "deployment_id",
-                        "EAC deployment id",
+                        "EAC deployment id — omit for a game in the built-in list",
                     )
-                    .required(true),
+                    .required(false),
                 )
                 .add_sub_option(
                     CreateCommandOption::new(
@@ -121,6 +180,11 @@ impl Handler {
                 )
                 .add_sub_option(game_option(true)),
             )
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "browse",
+                "Pick from the built-in list of known games",
+            ))
             .add_option(CreateCommandOption::new(
                 CommandOptionType::SubCommand,
                 "list",
@@ -217,7 +281,10 @@ impl Handler {
         };
 
         // Reconfiguration is gated; reading is not.
-        let mutating = matches!(sub.name.as_str(), "setup" | "add" | "remove" | "set");
+        let mutating = matches!(
+            sub.name.as_str(),
+            "setup" | "add" | "remove" | "set" | "browse"
+        );
         if mutating && !can_manage(cmd) {
             let _ = respond(
                 ctx,
@@ -231,6 +298,7 @@ impl Handler {
         let result = match sub.name.as_str() {
             "setup" => self.reply_setup(ctx, cmd, guild_id, options).await,
             "add" => self.reply_add(ctx, cmd, guild_id, options).await,
+            "browse" => self.reply_browse(ctx, cmd, guild_id).await,
             "remove" => self.reply_remove(ctx, cmd, guild_id, options).await,
             "list" => self.reply_list(ctx, cmd, guild_id).await,
             "config" => self.reply_config(ctx, cmd, guild_id).await,
@@ -292,56 +360,41 @@ impl Handler {
         }
     }
 
-    async fn reply_add(
+    /// Probe an id pair and store it when something is published.
+    ///
+    /// `requested` of `None` means detect: every candidate platform is probed
+    /// and the ones that answer are kept, because which shape a deployment
+    /// uses varies and a single default would be wrong for some.
+    async fn try_add(
         &self,
-        ctx: &Context,
-        cmd: &CommandInteraction,
         guild_id: u64,
-        options: &[CommandDataOption],
-    ) -> serenity::Result<()> {
-        let name = string_option(options, "game").unwrap_or_default();
-        let product_id = string_option(options, "product_id").unwrap_or_default();
-        let deployment_id = string_option(options, "deployment_id").unwrap_or_default();
-        // Omitting platforms means "work it out": every known candidate is
-        // probed and the ones that answer are kept. Both the composite forms
-        // and the bare OS types appear in the wild, so guessing a single
-        // default would be wrong for some deployments.
-        let requested = string_option(options, "platforms").filter(|p| !p.trim().is_empty());
+        name: &str,
+        product_id: &str,
+        deployment_id: &str,
+        requested: Option<&str>,
+    ) -> Result<AddOutcome, String> {
+        let product_id = product_id.trim();
+        let deployment_id = deployment_id.trim();
 
         // Validate before touching stored state: these values are interpolated
         // straight into a CDN URL.
-        let validated = settings::validate_name(&name)
-            .and_then(|()| settings::validate_id("product_id", product_id.trim()))
-            .and_then(|()| settings::validate_id("deployment_id", deployment_id.trim()))
-            .and_then(|()| match &requested {
-                Some(raw) => settings::parse_platforms(raw),
-                None => Ok(eac::CANDIDATE_PLATFORMS
-                    .iter()
-                    .map(|p| (*p).to_string())
-                    .collect()),
-            });
+        settings::validate_name(name).map_err(|e| e.to_string())?;
+        settings::validate_id("product_id", product_id).map_err(|e| e.to_string())?;
+        settings::validate_id("deployment_id", deployment_id).map_err(|e| e.to_string())?;
 
-        let platforms = match validated {
-            Ok(platforms) => platforms,
-            Err(e) => return respond(ctx, cmd, format!("{e}")).await,
+        let platforms: Vec<String> = match requested {
+            Some(raw) => settings::parse_platforms(raw).map_err(|e| e.to_string())?,
+            None => eac::CANDIDATE_PLATFORMS
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
         };
-        let searching = requested.is_none();
-
-        // Validating means a round trip per platform, which can exceed
-        // Discord's 3s window.
-        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
-            error!(error = ?e, "failed to defer");
-            return Ok(());
-        }
-
-        let product_id = product_id.trim().to_string();
-        let deployment_id = deployment_id.trim().to_string();
 
         // Confirm the ids are real before storing them: a wrong pair would
         // otherwise sit in the config as a silently dead target.
         let probes = self
             .tracker
-            .probe_platforms(&product_id, &deployment_id, &platforms)
+            .probe_platforms(product_id, deployment_id, &platforms)
             .await;
 
         let mut live = Vec::new();
@@ -353,79 +406,245 @@ impl Handler {
                 Err(e) => rejected.push(format!("`{platform}` — {e:#}")),
             }
         }
-
         if live.is_empty() {
-            let detail = rejected.join("\n");
-            return edit(
-                ctx,
-                cmd,
-                format!(
-                    "Nothing is published for those ids, so nothing was added:\n{detail}\n\n                     Check `product_id` and `deployment_id` against the game's                      EasyAntiCheat config, and try `platforms:win64`."
-                ),
-            )
-            .await;
+            return Err(format!("nothing published:\n{}", rejected.join("\n")));
         }
 
         let game = Game {
             name: name.trim().to_string(),
-            product_id,
-            deployment_id,
+            product_id: product_id.to_string(),
+            deployment_id: deployment_id.to_string(),
             platforms: live.iter().map(|(p, _)| p.clone()).collect(),
         };
 
-        // Seed from the config fallback so the first /eac add does not
-        // silently drop an operator-configured list.
+        // Seed from the config fallback so the first add does not silently
+        // drop an operator-configured list.
         let seed = self.games(guild_id);
-        let replaced = self.tracker.settings().edit_guild(guild_id, |g| {
-            if g.games.is_empty() {
-                g.games = seed;
-            }
-            let existing = g
-                .games
-                .iter()
-                .position(|existing| existing.name.eq_ignore_ascii_case(&game.name));
-            match existing {
-                Some(i) => {
-                    g.games[i] = game.clone();
-                    true
+        let stored = game.clone();
+        let replaced = self
+            .tracker
+            .settings()
+            .edit_guild(guild_id, move |g| {
+                if g.games.is_empty() {
+                    g.games = seed;
                 }
-                None => {
-                    g.games.push(game.clone());
-                    false
-                }
-            }
-        });
-
-        match replaced {
-            Ok(replaced) => {
-                let verb = if replaced { "Updated" } else { "Now tracking" };
-                let confirmed = live
+                match g
+                    .games
                     .iter()
-                    .map(|(platform, size)| match size {
-                        Some(bytes) => {
-                            format!("`{platform}` ({})", embed::human_bytes(*bytes))
-                        }
-                        None => format!("`{platform}`"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let mut message = format!("{verb} **{}** — verified {confirmed}.", game.name);
-                if !rejected.is_empty() && !searching {
-                    message.push_str(&format!(
-                        "\n\nNot published, so skipped:\n{}",
-                        rejected.join("\n")
-                    ));
+                    .position(|existing| existing.name.eq_ignore_ascii_case(&stored.name))
+                {
+                    Some(i) => {
+                        g.games[i] = stored;
+                        true
+                    }
+                    None => {
+                        g.games.push(stored);
+                        false
+                    }
                 }
+            })
+            .map_err(|e| {
+                error!(error = ?e, "failed to save settings");
+                format!("could not save: {e}")
+            })?;
+
+        Ok(AddOutcome {
+            game,
+            replaced,
+            live,
+            rejected,
+        })
+    }
+
+    async fn reply_add(
+        &self,
+        ctx: &Context,
+        cmd: &CommandInteraction,
+        guild_id: u64,
+        options: &[CommandDataOption],
+    ) -> serenity::Result<()> {
+        let name = string_option(options, "game").unwrap_or_default();
+        let requested = string_option(options, "platforms").filter(|p| !p.trim().is_empty());
+
+        // Ids may be omitted for a catalogue game, so `/eac add game:Rust`
+        // works without looking anything up.
+        let (product_id, deployment_id) = match (
+            string_option(options, "product_id"),
+            string_option(options, "deployment_id"),
+        ) {
+            (Some(product), Some(deployment)) => (product, deployment),
+            _ => match catalog::find(&name) {
+                Some(known) => (
+                    known.product_id.to_string(),
+                    known.deployment_id.to_string(),
+                ),
+                None => {
+                    return respond(
+                        ctx,
+                        cmd,
+                        format!(
+                            "**{name}** is not in the built-in list, so it needs \
+                             `product_id` and `deployment_id`. Run `/eac browse` to \
+                             see the known games, or `eac-tracker discover` to read \
+                             the ids out of an install."
+                        ),
+                    )
+                    .await;
+                }
+            },
+        };
+
+        // Probing means a round trip per platform, which can exceed Discord's
+        // three-second window.
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            error!(error = ?e, "failed to defer");
+            return Ok(());
+        }
+
+        let detecting = requested.is_none();
+        match self
+            .try_add(
+                guild_id,
+                &name,
+                &product_id,
+                &deployment_id,
+                requested.as_deref(),
+            )
+            .await
+        {
+            Ok(outcome) => {
+                let mut message = outcome.describe(!detecting);
                 if self.announce_channel(guild_id).is_none() {
                     message.push_str("\n\nNo announce channel is set yet — run `/eac setup`.");
                 }
                 edit(ctx, cmd, message).await
             }
             Err(e) => {
-                error!(error = ?e, "failed to save settings");
-                edit(ctx, cmd, format!("Could not save that: {e}")).await
+                edit(
+                    ctx,
+                    cmd,
+                    format!(
+                        "Nothing was added — {e}\n\nCheck the ids against the game's \
+                         EasyAntiCheat config. The game may also use the legacy EAC \
+                         backend, which this CDN does not serve."
+                    ),
+                )
+                .await
             }
+        }
+    }
+
+    /// Offer the built-in catalogue as a pick list.
+    async fn reply_browse(
+        &self,
+        ctx: &Context,
+        cmd: &CommandInteraction,
+        guild_id: u64,
+    ) -> serenity::Result<()> {
+        let tracked = self.games(guild_id);
+        let offered = catalog::not_yet_tracked(&tracked);
+
+        if offered.is_empty() {
+            return respond(
+                ctx,
+                cmd,
+                "Every game in the built-in list is already tracked. Use `/eac add` \
+                 for anything else.",
+            )
+            .await;
+        }
+
+        let options: Vec<CreateSelectMenuOption> = offered
+            .iter()
+            .map(|known| {
+                CreateSelectMenuOption::new(known.name, known.name)
+                    .description(format!("product {}", truncate_id(known.product_id)))
+            })
+            .collect();
+
+        let menu = CreateSelectMenu::new(
+            SELECT_KNOWN,
+            CreateSelectMenuKind::String {
+                options: options.clone(),
+            },
+        )
+        .placeholder("Pick the games to track")
+        .min_values(1)
+        .max_values(options.len() as u8);
+
+        cmd.create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(
+                        "Known EAC deployments. Pick any number — each is checked \
+                         against the CDN before it is added, and ones that publish \
+                         nothing are skipped.",
+                    )
+                    .select_menu(menu)
+                    .ephemeral(true),
+            ),
+        )
+        .await
+    }
+
+    /// Add everything picked from the catalogue.
+    async fn handle_selection(&self, ctx: &Context, mc: &ComponentInteraction) {
+        let ComponentInteractionDataKind::StringSelect { values } = &mc.data.kind else {
+            return;
+        };
+        let Some(guild_id) = mc.guild_id.map(|g| g.get()) else {
+            return;
+        };
+        if !permits_manage(mc.member.as_ref().and_then(|m| m.permissions)) {
+            let _ = mc
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You need the **Manage Server** permission.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        if let Err(e) = mc.defer_ephemeral(&ctx.http).await {
+            error!(error = ?e, "failed to defer selection");
+            return;
+        }
+
+        let mut lines = Vec::new();
+        for name in values {
+            let Some(known) = catalog::find(name) else {
+                continue;
+            };
+            match self
+                .try_add(
+                    guild_id,
+                    known.name,
+                    known.product_id,
+                    known.deployment_id,
+                    None,
+                )
+                .await
+            {
+                // Detected platforms, so unpublished candidates are expected.
+                Ok(outcome) => lines.push(outcome.describe(false)),
+                Err(e) => lines.push(format!("**{}** — not added, {e}", known.name)),
+            }
+        }
+        if self.announce_channel(guild_id).is_none() {
+            lines.push("\nNo announce channel is set yet — run `/eac setup`.".to_string());
+        }
+
+        let body = truncate_message(&lines.join("\n"), "Nothing was selected.");
+        if let Err(e) = mc
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(body))
+            .await
+        {
+            error!(error = ?e, "failed to report selection result");
         }
     }
 
@@ -720,6 +939,9 @@ impl EventHandler for Handler {
             Interaction::Autocomplete(ac) if ac.data.name == "eac" => {
                 self.handle_autocomplete(&ctx, &ac).await;
             }
+            Interaction::Component(mc) if mc.data.custom_id == SELECT_KNOWN => {
+                self.handle_selection(&ctx, &mc).await;
+            }
             _ => {}
         }
     }
@@ -730,12 +952,15 @@ impl EventHandler for Handler {
 /// Discord resolves the member's effective permissions into the interaction,
 /// so this needs no extra lookup. Absent permissions are treated as denied.
 fn can_manage(cmd: &CommandInteraction) -> bool {
-    cmd.member
-        .as_ref()
-        .and_then(|m| m.permissions)
-        .is_some_and(|p| {
-            p.contains(Permissions::MANAGE_GUILD) || p.contains(Permissions::ADMINISTRATOR)
-        })
+    permits_manage(cmd.member.as_ref().and_then(|m| m.permissions))
+}
+
+/// Discord resolves the member's effective permissions into the interaction,
+/// so this needs no extra lookup. Absent permissions are treated as denied.
+fn permits_manage(permissions: Option<Permissions>) -> bool {
+    permissions.is_some_and(|p| {
+        p.contains(Permissions::MANAGE_GUILD) || p.contains(Permissions::ADMINISTRATOR)
+    })
 }
 
 fn string_option(options: &[CommandDataOption], name: &str) -> Option<String> {
@@ -819,6 +1044,89 @@ mod tests {
                 ),
                 "no handler branch for {name}"
             );
+        }
+    }
+
+    fn outcome(name: &str, replaced: bool) -> AddOutcome {
+        AddOutcome {
+            game: Game {
+                name: name.into(),
+                product_id: "p".into(),
+                deployment_id: "d".into(),
+                platforms: vec!["wow64_win64".into()],
+            },
+            replaced,
+            live: vec![("wow64_win64".into(), Some(23_068_672))],
+            rejected: vec!["`mac64` — HTTP 404".into()],
+        }
+    }
+
+    #[test]
+    fn describes_a_new_and_an_updated_game() {
+        let added = outcome("Rust", false).describe(false);
+        assert!(added.starts_with("Now tracking **Rust**"), "got {added}");
+        assert!(added.contains("`wow64_win64` (22.0 MB)"), "got {added}");
+
+        let updated = outcome("Rust", true).describe(false);
+        assert!(updated.starts_with("Updated **Rust**"), "got {updated}");
+    }
+
+    #[test]
+    fn skipped_platforms_are_reported_only_when_they_were_asked_for() {
+        // Detecting: most candidates not matching is expected, not news.
+        assert!(!outcome("Rust", false).describe(false).contains("mac64"));
+        // Explicitly requested: the reader needs to know one was dropped.
+        assert!(outcome("Rust", false).describe(true).contains("mac64"));
+    }
+
+    #[test]
+    fn select_menu_descriptions_stay_short() {
+        assert_eq!(
+            truncate_id("429c2212ad284866aee071454c2125b5"),
+            "429c2212ad28…"
+        );
+        assert_eq!(
+            truncate_id("prod-fn"),
+            "prod-fn",
+            "short ids are left alone"
+        );
+    }
+
+    #[test]
+    fn manage_permission_is_required_and_absence_is_denial() {
+        assert!(permits_manage(Some(Permissions::MANAGE_GUILD)));
+        assert!(permits_manage(Some(Permissions::ADMINISTRATOR)));
+        assert!(!permits_manage(Some(Permissions::SEND_MESSAGES)));
+        assert!(!permits_manage(None), "unknown permissions must not pass");
+    }
+
+    #[test]
+    fn the_command_fits_discords_schema() {
+        // Discord rejects a command with more than 25 options outright.
+        let json = serde_json::to_value(Handler::command()).unwrap();
+        let options = json["options"].as_array().expect("subcommands");
+        assert!(options.len() <= 25, "too many subcommands");
+
+        let names: Vec<&str> = options
+            .iter()
+            .map(|o| o["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "setup", "add", "browse", "remove", "list", "config", "status", "check", "set",
+        ] {
+            assert!(names.contains(&expected), "missing /eac {expected}");
+        }
+
+        // Every subcommand routed by handle_command must exist on the command,
+        // and every subcommand on the command must be routed.
+        assert_eq!(names.len(), 9, "a subcommand was added without a route");
+    }
+
+    #[test]
+    fn catalogue_games_can_be_added_without_ids() {
+        // reply_add falls back to the catalogue, so a browse name must resolve.
+        for known in catalog::KNOWN {
+            assert!(catalog::find(known.name).is_some());
         }
     }
 }

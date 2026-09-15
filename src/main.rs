@@ -2,7 +2,7 @@
 //! Games CDN and posts an embed whenever a game's modules change.
 
 use anyhow::{Context, Result};
-use eac_tracker::{bot, config, discover, eac, settings, tracker};
+use eac_tracker::{bot, catalog, config, discover, eac, settings, tracker};
 use serenity::all::GatewayIntents;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ USAGE:
     eac-tracker                        Run the bot (default)
     eac-tracker discover [PATH]...     Find EAC ids in installed games
     eac-tracker probe ID ID [PLAT]...  Check whether an id pair is live
+    eac-tracker catalog [--probe]      List the built-in known games
     eac-tracker --help
 
 PROBE:
@@ -73,6 +74,7 @@ async fn main() -> Result<()> {
         }
         Some("discover") => run_discover(&args[1..]).await,
         Some("probe") => run_probe(&args[1..]).await,
+        Some("catalog" | "catalogue") => run_catalog(&args[1..]).await,
         Some(other) if other.starts_with('-') => {
             eprintln!("unknown option `{other}`\n\n{USAGE}");
             std::process::exit(2);
@@ -381,6 +383,79 @@ async fn run_probe(args: &[String]) -> Result<()> {
 
     if live.is_empty() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn run_catalog(args: &[String]) -> Result<()> {
+    let probe = args.iter().any(|a| a == "--probe");
+    let as_json = args.iter().any(|a| a == "--json");
+    if let Some(bad) = args
+        .iter()
+        .find(|a| !matches!(a.as_str(), "--probe" | "--json"))
+    {
+        eprintln!("unknown catalog option `{bad}`\n\n{USAGE}");
+        std::process::exit(2);
+    }
+
+    #[derive(serde::Serialize)]
+    struct Entry {
+        name: &'static str,
+        product_id: &'static str,
+        deployment_id: &'static str,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        platforms: Vec<String>,
+    }
+
+    let client = probe.then(probe_client).transpose()?;
+    let mut entries = Vec::new();
+
+    for known in catalog::KNOWN {
+        let mut platforms = Vec::new();
+        if let Some(client) = &client {
+            eprintln!("Probing {}...", known.name);
+            for platform in eac::CANDIDATE_PLATFORMS {
+                match client
+                    .probe(known.product_id, known.deployment_id, platform)
+                    .await
+                {
+                    Ok(p) if p.ok() => platforms.push((*platform).to_string()),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("  {platform}: {e:#}"),
+                }
+            }
+        }
+        entries.push(Entry {
+            name: known.name,
+            product_id: known.product_id,
+            deployment_id: known.deployment_id,
+            platforms,
+        });
+    }
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+
+    println!();
+    for entry in &entries {
+        println!("{}", entry.name);
+        println!("  product_id:    {}", entry.product_id);
+        println!("  deployment_id: {}", entry.deployment_id);
+        if probe {
+            match entry.platforms.as_slice() {
+                [] => println!("  platforms:     none responded"),
+                found => println!("  platforms:     {}", found.join(", ")),
+            }
+        }
+        println!();
+    }
+    if !probe {
+        eprintln!(
+            "These pairs come from published research and are not verified here. \
+             Re-run with --probe to check them against the CDN."
+        );
     }
     Ok(())
 }
