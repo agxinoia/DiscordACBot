@@ -124,9 +124,36 @@ pub struct Probe {
     pub content_length: Option<u64>,
 }
 
+/// Smallest response plausibly containing a real module.
+///
+/// Measured modules run from 8.2 MB to 32.8 MB. Well under that is a stub or
+/// an error document: one deployment answers for three legacy platform names
+/// with an identical 13.8 KB body, which is not a module however much it looks
+/// like a success.
+pub const MIN_PLAUSIBLE_MODULE_BYTES: u64 = 1024 * 1024;
+
 impl Probe {
+    /// A 2xx status. Necessary but not sufficient — see [`Probe::is_module`].
     pub fn ok(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Whether this target is worth tracking.
+    ///
+    /// An empty body is never a module: the CDN answers 200 with
+    /// `Content-Length: 0` for platforms a deployment does not publish, and
+    /// tracking one would watch a target that can never meaningfully change.
+    pub fn is_module(&self) -> bool {
+        self.ok() && self.content_length != Some(0)
+    }
+
+    /// Non-empty, but far too small to be a real module. Tracked if asked for,
+    /// since a small legacy module is conceivable, but worth saying out loud.
+    pub fn suspicious(&self) -> bool {
+        self.is_module()
+            && self
+                .content_length
+                .is_some_and(|n| n < MIN_PLAUSIBLE_MODULE_BYTES)
     }
 }
 
@@ -520,5 +547,60 @@ mod tests {
     fn scanning_skips_short_and_non_module_tokens() {
         let modules = parse_modules(b"a.so readme.txt notes");
         assert!(modules.is_empty(), "got {modules:?}");
+    }
+
+    fn probe(status: u16, content_length: Option<u64>) -> Probe {
+        Probe {
+            url: String::new(),
+            platform: "win64".into(),
+            status,
+            content_length,
+        }
+    }
+
+    #[test]
+    fn an_empty_body_is_not_a_module() {
+        // The CDN answers 200 with Content-Length: 0 for platforms a
+        // deployment does not publish.
+        let empty = probe(200, Some(0));
+        assert!(empty.ok(), "it really is a 2xx");
+        assert!(!empty.is_module(), "but there is nothing there to track");
+        assert!(!empty.suspicious());
+    }
+
+    #[test]
+    fn real_module_sizes_are_accepted() {
+        // Sizes measured against the live CDN.
+        for bytes in [8_598_323u64, 10_695_475, 21_915_238, 32_820_838] {
+            let p = probe(200, Some(bytes));
+            assert!(p.is_module(), "{bytes} is a real module");
+            assert!(!p.suspicious(), "{bytes} is not suspicious");
+        }
+    }
+
+    #[test]
+    fn a_stub_is_tracked_but_flagged() {
+        // One deployment answers for three legacy platform names with an
+        // identical 13.8 KB body — a stub, not a module.
+        let stub = probe(200, Some(14_131));
+        assert!(stub.is_module(), "not empty, so not rejected outright");
+        assert!(stub.suspicious(), "but far below any real module");
+    }
+
+    #[test]
+    fn a_missing_target_is_neither() {
+        let missing = probe(404, None);
+        assert!(!missing.ok());
+        assert!(!missing.is_module());
+        assert!(!missing.suspicious());
+    }
+
+    #[test]
+    fn an_unreported_size_is_given_the_benefit_of_the_doubt() {
+        // Not every server sends Content-Length; refusing on that basis would
+        // reject targets that are fine.
+        let unknown = probe(200, None);
+        assert!(unknown.is_module());
+        assert!(!unknown.suspicious());
     }
 }

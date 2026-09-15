@@ -165,28 +165,35 @@ refuses ones that publish nothing.
 ### Platform strings
 
 A deployment publishes only some platforms, and which ones varies more than you
-would expect. Measured against the live CDN:
+would expect. Measured against the live CDN, with the size each returns:
 
-| Platform | Apex | ARC Raiders | Fortnite | Rust |
-| --- | :-: | :-: | :-: | :-: |
-| `win64` | ✓ | ✓ | ✓ | ✓ |
-| `winarm_x64_x64` | ✓ | ✓ | ✓ | ✓ |
-| `mac64` | | ✓ | ✓ | ✓ |
-| `linux32_64` | ✓ | ✓ | ✓ | |
-| `wow64_win64` | | ✓ | | |
-| `win32` | | ✓ | | |
-| `wow64` | | ✓ | | |
-| `wine64` | | | ✓ | |
-| `wine32` | | | ✓ | |
+| Platform | Apex Legends | ARC Raiders | Fortnite | Rust |
+| --- | --- | --- | --- | --- |
+| `win64` | 32.4 MB | 21.9 MB | 32.8 MB | 32.7 MB |
+| `winarm_x64_x64` | 22.5 MB | 17.1 MB | 22.8 MB | 22.9 MB |
+| `mac64` | — | *0 B* | 9.2 MB | 9.5 MB |
+| `linux32_64` | 8.2 MB | 10.2 MB | *0 B* | — |
+| `wow64_win64` | — | *13.8 KB* | — | — |
+| `win32` | — | *13.8 KB* | — | — |
+| `wow64` | — | *13.8 KB* | — | — |
+| `wine64` | — | — | *0 B* | — |
+| `wine32` | — | — | *0 B* | — |
 
-Both shapes are real. The bare names are OS types; the composites name a
+Real modules run 8–33 MB. The italic entries are the reason a 2xx is not taken
+as proof on its own:
+
+- **0 B** — the CDN answers `200 Content-Length: 0` for platforms a deployment
+  does not publish. These are rejected: tracking one would watch a target that
+  can never meaningfully change.
+- **13.8 KB, identical across three legacy platform names** — a stub rather
+  than a module. Small enough to be obvious once the size is shown, and
+  invisible if you only look at the status. These are still tracked if you ask
+  for them, since a small legacy module is conceivable, but they are flagged.
+
+Both naming shapes are real. The bare names are OS types; the composites name a
 *combination* of targets, because one response bundles several architectures.
 There is no way to predict the set from the ids, which is why `/eac add` probes
-every candidate and keeps whatever answers rather than assuming one.
-
-A 2xx alone does not prove a platform is genuinely published — a CDN can answer
-with an error document — so `--probe` reports the size of each, and flags
-anything too small to be a module.
+every candidate and keeps whatever genuinely publishes something.
 
 ### The built-in list
 

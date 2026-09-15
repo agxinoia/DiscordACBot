@@ -207,7 +207,7 @@ async fn run_discover(args: &[String]) -> Result<()> {
                     .probe(&finding.product_id, &finding.deployment_id, platform)
                     .await
                 {
-                    Ok(p) if p.ok() => {
+                    Ok(p) if p.is_module() => {
                         println!("  {:<16} {}", platform, describe_size(p.content_length));
                         finding.platforms.push(platform.clone());
                     }
@@ -322,13 +322,13 @@ async fn run_probe(args: &[String]) -> Result<()> {
         let report = match client.probe(product_id, deployment_id, platform).await {
             Ok(p) => {
                 reachable = true;
-                if p.ok() {
+                if p.is_module() {
                     live.push(platform.clone());
                 }
                 ProbeReport {
                     platform: platform.clone(),
                     url: p.url.clone(),
-                    live: p.ok(),
+                    live: p.is_module(),
                     status: Some(p.status),
                     size: p.content_length,
                     error: None,
@@ -346,16 +346,18 @@ async fn run_probe(args: &[String]) -> Result<()> {
         if !as_json {
             match (&report.error, report.live) {
                 (Some(error), _) => println!("  {:<10} unreachable — {error}", report.platform),
-                (None, true) => println!(
-                    "  {:<10} live    {}",
-                    report.platform,
-                    report
-                        .size
-                        .map(eac_tracker::embed::human_bytes)
-                        .unwrap_or_else(|| "size unknown".into())
-                ),
+                (None, true) => {
+                    println!(
+                        "  {:<16} live    {}",
+                        report.platform,
+                        describe_size(report.size)
+                    )
+                }
+                (None, false) if report.status == Some(200) => {
+                    println!("  {:<16} {}", report.platform, describe_size(report.size))
+                }
                 (None, false) => println!(
-                    "  {:<10} not published (HTTP {})",
+                    "  {:<16} not published (HTTP {})",
                     report.platform,
                     report.status.unwrap_or(0)
                 ),
@@ -429,7 +431,7 @@ async fn run_catalog(args: &[String]) -> Result<()> {
                     .probe(known.product_id, known.deployment_id, platform)
                     .await
                 {
-                    Ok(p) if p.ok() => platforms.push(Published {
+                    Ok(p) if p.is_module() => platforms.push(Published {
                         platform: (*platform).to_string(),
                         bytes: p.content_length,
                     }),
@@ -488,7 +490,10 @@ async fn run_catalog(args: &[String]) -> Result<()> {
 /// from an alias that merely resolves.
 fn describe_size(bytes: Option<u64>) -> String {
     match bytes {
-        Some(n) if n < 4096 => format!("{} — too small to be a module", human_bytes(n)),
+        Some(0) => "published nothing (0 B)".to_string(),
+        Some(n) if n < eac::MIN_PLAUSIBLE_MODULE_BYTES => {
+            format!("{} — probably a stub, not a module", human_bytes(n))
+        }
         Some(n) => human_bytes(n),
         None => "size not reported".to_string(),
     }

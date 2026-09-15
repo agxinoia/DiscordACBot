@@ -74,6 +74,23 @@ impl AddOutcome {
             .join(", ");
 
         let mut message = format!("{verb} **{}** — verified {confirmed}.", self.game.name);
+        // A module far below the observed size range is probably a stub.
+        let stubs: Vec<&str> = self
+            .live
+            .iter()
+            .filter(|(_, size)| size.is_some_and(|n| n < eac::MIN_PLAUSIBLE_MODULE_BYTES))
+            .map(|(platform, _)| platform.as_str())
+            .collect();
+        if !stubs.is_empty() {
+            message.push_str(&format!(
+                "\n\nSuspiciously small, so possibly a stub rather than a module: {}",
+                stubs
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if show_rejected && !self.rejected.is_empty() {
             message.push_str(&format!(
                 "\n\nNot published, so skipped:\n{}",
@@ -401,7 +418,10 @@ impl Handler {
         let mut rejected = Vec::new();
         for (platform, probe) in platforms.iter().zip(probes) {
             match probe {
-                Ok(p) if p.ok() => live.push((platform.clone(), p.content_length)),
+                Ok(p) if p.is_module() => live.push((platform.clone(), p.content_length)),
+                // A 2xx with an empty body means "not published here", so say
+                // that rather than reporting a success that stores nothing.
+                Ok(p) if p.ok() => rejected.push(format!("`{platform}` — published nothing (0 B)")),
                 Ok(p) => rejected.push(format!("`{platform}` — HTTP {}", p.status)),
                 Err(e) => rejected.push(format!("`{platform}` — {e:#}")),
             }
