@@ -108,7 +108,7 @@ impl Handler {
                     CreateCommandOption::new(
                         CommandOptionType::String,
                         "platforms",
-                        "Comma separated. Defaults to wow64_win64 (Windows x64)",
+                        "Comma separated. Leave empty to detect them automatically",
                     )
                     .required(false),
                 ),
@@ -302,20 +302,30 @@ impl Handler {
         let name = string_option(options, "game").unwrap_or_default();
         let product_id = string_option(options, "product_id").unwrap_or_default();
         let deployment_id = string_option(options, "deployment_id").unwrap_or_default();
-        let platforms_raw = string_option(options, "platforms")
-            .unwrap_or_else(|| eac::DEFAULT_PLATFORM.to_string());
+        // Omitting platforms means "work it out": every known candidate is
+        // probed and the ones that answer are kept. Both the composite forms
+        // and the bare OS types appear in the wild, so guessing a single
+        // default would be wrong for some deployments.
+        let requested = string_option(options, "platforms").filter(|p| !p.trim().is_empty());
 
         // Validate before touching stored state: these values are interpolated
         // straight into a CDN URL.
         let validated = settings::validate_name(&name)
             .and_then(|()| settings::validate_id("product_id", product_id.trim()))
             .and_then(|()| settings::validate_id("deployment_id", deployment_id.trim()))
-            .and_then(|()| settings::parse_platforms(&platforms_raw));
+            .and_then(|()| match &requested {
+                Some(raw) => settings::parse_platforms(raw),
+                None => Ok(eac::CANDIDATE_PLATFORMS
+                    .iter()
+                    .map(|p| (*p).to_string())
+                    .collect()),
+            });
 
         let platforms = match validated {
             Ok(platforms) => platforms,
             Err(e) => return respond(ctx, cmd, format!("{e}")).await,
         };
+        let searching = requested.is_none();
 
         // Validating means a round trip per platform, which can exceed
         // Discord's 3s window.
@@ -401,7 +411,7 @@ impl Handler {
                     .join(", ");
 
                 let mut message = format!("{verb} **{}** — verified {confirmed}.", game.name);
-                if !rejected.is_empty() {
+                if !rejected.is_empty() && !searching {
                     message.push_str(&format!(
                         "\n\nNot published, so skipped:\n{}",
                         rejected.join("\n")

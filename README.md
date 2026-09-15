@@ -162,9 +162,11 @@ architecture, because a single response bundles several. Known forms:
 | `mac64` | macOS |
 | `linux32_64` | Linux |
 
-Bare OS types (`win64`, `win32`, `wow64`, `wine64`, `wine32`) appear in EAC's
-own configuration and are tried as fallbacks, but composites are what real
-deployments answer for. `probe` with no platform argument tries all of them.
+Bare OS types (`win64`, `win32`, `wow64`, `wine64`, `wine32`) also appear in
+the wild, so both shapes are tried. Leave `platforms` off `/eac add` and every
+candidate is probed, keeping whichever answer — better than guessing a single
+default, since which one is right varies by deployment. `probe` with no
+platform argument does the same.
 
 ### Known deployments
 
@@ -353,7 +355,7 @@ not. Replies are ephemeral, so configuring the bot does not clutter the channel.
 | Command | Description |
 | --- | --- |
 | `/eac setup channel:<#channel>` | Choose where updates are posted. |
-| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. Each platform is probed first; ones that publish nothing are rejected, not stored. `platforms` defaults to `wow64_win64`. |
+| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. Each platform is probed first; ones that publish nothing are rejected, not stored. Omit `platforms` to detect them automatically. |
 | `/eac remove game:<name>` | Stop tracking a game. |
 | `/eac list` | Games and platforms being tracked. |
 | `/eac config` | This server's current configuration. |
