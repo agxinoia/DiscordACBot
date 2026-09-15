@@ -85,6 +85,18 @@ There is no config file in the normal case. `config.toml` is optional and only
 changes operator-level defaults — paths, timeouts, and fallbacks for servers
 that have not configured themselves. See `config.example.toml`.
 
+### Running the command-line tools
+
+`cargo build --release` leaves the binary at `./target/release/eac-tracker`; it
+is not on your `PATH`. Either call it by that path, or install it once:
+
+```sh
+cargo install --path .        # puts eac-tracker on PATH via ~/.cargo/bin
+```
+
+The examples below write `eac-tracker` for brevity. Without installing, prefix
+them with `./target/release/`.
+
 ### Finding product and deployment ids
 
 Both ids come from the game's own EasyAntiCheat configuration, shipped inside
