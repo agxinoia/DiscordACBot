@@ -187,8 +187,10 @@ as proof on its own:
   can never meaningfully change.
 - **13.8 KB, identical across three legacy platform names** — a stub rather
   than a module. Small enough to be obvious once the size is shown, and
-  invisible if you only look at the status. These are still tracked if you ask
-  for them, since a small legacy module is conceivable, but they are flagged.
+  invisible if you only look at the status. Detection skips these — adding
+  three targets that all return the same tiny body is noise — but naming one
+  explicitly in `platforms:` still tracks it, flagged. A deployment that
+  publishes nothing but stubs falls back to them rather than being refused.
 
 Both naming shapes are real. The bare names are OS types; the composites name a
 *combination* of targets, because one response bundles several architectures.

@@ -415,9 +415,16 @@ impl Handler {
             .await;
 
         let mut live = Vec::new();
+        let mut stubs = Vec::new();
         let mut rejected = Vec::new();
         for (platform, probe) in platforms.iter().zip(probes) {
             match probe {
+                // Detecting means picking the real modules. A stub asked for
+                // by name is still honoured, but auto-adding several that all
+                // return the same tiny body is just noise.
+                Ok(p) if p.is_module() && p.suspicious() && requested.is_none() => {
+                    stubs.push((platform.clone(), p.content_length))
+                }
                 Ok(p) if p.is_module() => live.push((platform.clone(), p.content_length)),
                 // A 2xx with an empty body means "not published here", so say
                 // that rather than reporting a success that stores nothing.
@@ -426,8 +433,20 @@ impl Handler {
                 Err(e) => rejected.push(format!("`{platform}` — {e:#}")),
             }
         }
+        // Fall back to the stubs rather than refusing outright: a deployment
+        // that publishes only small modules is still worth tracking.
+        let only_stubs = live.is_empty() && !stubs.is_empty();
+        if only_stubs {
+            live = std::mem::take(&mut stubs);
+        }
         if live.is_empty() {
             return Err(format!("nothing published:\n{}", rejected.join("\n")));
+        }
+        for (platform, size) in &stubs {
+            rejected.push(format!(
+                "`{platform}` — {}, probably a stub",
+                embed::human_bytes(size.unwrap_or(0))
+            ));
         }
 
         let game = Game {

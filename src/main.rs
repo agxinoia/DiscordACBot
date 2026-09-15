@@ -209,7 +209,11 @@ async fn run_discover(args: &[String]) -> Result<()> {
                 {
                     Ok(p) if p.is_module() => {
                         println!("  {:<16} {}", platform, describe_size(p.content_length));
-                        finding.platforms.push(platform.clone());
+                        // Shown either way, but only real modules go into the
+                        // suggested command.
+                        if !p.suspicious() {
+                            finding.platforms.push(platform.clone());
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
