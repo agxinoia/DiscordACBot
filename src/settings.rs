@@ -207,8 +207,14 @@ pub fn validate_id(label: &str, value: &str) -> Result<()> {
     if value.is_empty() || value.len() > 64 {
         bail!("{label} must be between 1 and 64 characters");
     }
-    if !value.chars().all(|c| c.is_ascii_alphanumeric()) {
-        bail!("{label} must be alphanumeric — got `{value}`");
+    // Usually a 32-character hex string, but not always: Fortnite's product
+    // id is `prod-fn`. Hyphen and underscore are allowed; `.` and the path
+    // separators are not, so `..` cannot appear however it is spelled.
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("{label} may only contain letters, digits, hyphen and underscore — got `{value}`");
     }
     Ok(())
 }
@@ -444,10 +450,15 @@ mod tests {
     #[test]
     fn ids_that_would_escape_the_url_path_are_rejected() {
         assert!(validate_id("product id", "9e8b37541e614575b4de303d2c2e44cf").is_ok());
+        // Not every id is hex: Fortnite's product id is `prod-fn`.
+        assert!(validate_id("product id", "prod-fn").is_ok());
+        assert!(validate_id("product id", "some_id").is_ok());
+
         // These are the ones that matter: the value goes straight into a URL.
         assert!(validate_id("product id", "../../etc/passwd").is_err());
         assert!(validate_id("product id", "a/b").is_err());
         assert!(validate_id("product id", "..").is_err());
+        assert!(validate_id("product id", "a.b").is_err());
         assert!(validate_id("product id", "").is_err());
         assert!(validate_id("product id", &"a".repeat(65)).is_err());
     }

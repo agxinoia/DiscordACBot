@@ -180,6 +180,121 @@ pub fn machine_name(machine: u16) -> &'static str {
     }
 }
 
+/// A PE image found embedded inside a larger blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CarvedModule {
+    /// Byte offset of the `MZ` header within the containing blob.
+    pub offset: usize,
+    pub size: usize,
+    pub machine: String,
+    pub timestamp: u32,
+    pub is_dll: bool,
+    /// From the export directory, or VS_VERSIONINFO's OriginalFilename.
+    pub name: Option<String>,
+    pub sha256: String,
+    pub entropy: f64,
+}
+
+/// Upper bound on modules carved from one payload, so a blob full of `MZ`
+/// bytes cannot turn into an unbounded scan.
+const MAX_CARVED_MODULES: usize = 32;
+
+/// Find PE images embedded at any offset in a blob.
+///
+/// EAC does not serve a bare PE: the response is a container whose modules sit
+/// at offsets, so parsing the payload as a single image fails. One response
+/// carries several architectures at once, which is why a platform segment is a
+/// composite like `wow64_win64` — carving them apart is what produces the
+/// per-module breakdown.
+///
+/// Size is headers plus sections, i.e. the image as laid out on disk. Any
+/// trailing signature blob is excluded, which keeps the boundary deterministic.
+pub fn carve_pe_modules(bytes: &[u8]) -> Vec<CarvedModule> {
+    use sha2::{Digest, Sha256};
+
+    let mut found = Vec::new();
+    let mut at = 0usize;
+
+    while at + 0x40 < bytes.len() && found.len() < MAX_CARVED_MODULES {
+        let Some(relative) = bytes[at..].windows(2).position(|w| w == b"MZ") else {
+            break;
+        };
+        let start = at + relative;
+
+        let Some(pe) = pe_at(bytes, start) else {
+            // Not a real header — step past this `MZ` and keep looking.
+            at = start + 2;
+            continue;
+        };
+
+        let available = bytes.len() - start;
+        let size = image_size(&pe, available);
+        let image = &bytes[start..start + size];
+
+        found.push(CarvedModule {
+            offset: start,
+            size,
+            machine: machine_name(pe.header.coff_header.machine).to_string(),
+            timestamp: pe.header.coff_header.time_date_stamp,
+            is_dll: pe.is_lib,
+            name: module_name(&pe, image),
+            sha256: hex::encode(Sha256::digest(image)),
+            entropy: shannon_entropy(image),
+        });
+
+        // Skip the whole image: its DOS stub and section data contain further
+        // `MZ` bytes that are not separate modules.
+        at = start + size.max(2);
+    }
+    found
+}
+
+/// Parse a PE at `start`, returning `None` unless the headers really are there.
+fn pe_at(bytes: &[u8], start: usize) -> Option<goblin::pe::PE<'_>> {
+    let slice = bytes.get(start..)?;
+    // Confirm e_lfanew points at a "PE\0\0" signature before parsing, so the
+    // common case of stray "MZ" bytes costs almost nothing.
+    let lfanew = slice.get(0x3C..0x40)?;
+    let lfanew = u32::from_le_bytes([lfanew[0], lfanew[1], lfanew[2], lfanew[3]]) as usize;
+    if slice.get(lfanew..lfanew + 4)? != b"PE\0\0" {
+        return None;
+    }
+    goblin::pe::PE::parse(slice).ok()
+}
+
+fn image_size(pe: &goblin::pe::PE, available: usize) -> usize {
+    let end = pe
+        .sections
+        .iter()
+        .map(|s| s.pointer_to_raw_data as usize + s.size_of_raw_data as usize)
+        .max()
+        .unwrap_or(0);
+    end.clamp(1, available)
+}
+
+fn module_name(pe: &goblin::pe::PE, image: &[u8]) -> Option<String> {
+    pe.name
+        .map(str::to_owned)
+        .or_else(|| {
+            parse_version_info(image)?
+                .strings
+                .get("OriginalFilename")
+                .cloned()
+        })
+        .filter(|n| !n.trim().is_empty())
+}
+
+/// PE detail for a payload's primary image.
+///
+/// Falls back to the first carved module when the payload is a container
+/// rather than a bare PE, which is the normal case for this CDN.
+pub fn analyse_primary_pe(bytes: &[u8]) -> Option<PeInfo> {
+    analyse_pe(bytes).or_else(|| {
+        let first = carve_pe_modules(bytes).into_iter().next()?;
+        analyse_pe(bytes.get(first.offset..first.offset + first.size)?)
+    })
+}
+
 /// Parse a payload as a PE image. Returns `None` for anything else.
 pub fn analyse_pe(bytes: &[u8]) -> Option<PeInfo> {
     let pe = goblin::pe::PE::parse(bytes).ok()?;
@@ -717,5 +832,77 @@ mod tests {
     fn malformed_signature_blobs_are_ignored_rather_than_fatal() {
         assert!(parse_pkcs7_certs(b"not der at all").is_empty());
         assert!(parse_pkcs7_certs(&[]).is_empty());
+    }
+
+    /// Three images of different architectures in one blob, with junk between
+    /// them — the shape the CDN actually serves.
+    fn container() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let modules = vec![
+            minimal_pe(0xAA64, 1_700_000_000, (b".text\0\0\0", &[0x11; 600])),
+            minimal_pe(0x014C, 1_700_000_100, (b".text\0\0\0", &[0x22; 300])),
+            minimal_pe(0x8664, 1_700_000_200, (b".text\0\0\0", &[0x33; 900])),
+        ];
+        let mut blob = vec![0xEF; 128]; // container header
+        for module in &modules {
+            blob.extend_from_slice(module);
+            blob.extend_from_slice(&[0xAB; 64]); // padding between images
+        }
+        (blob, modules)
+    }
+
+    #[test]
+    fn carves_every_embedded_image_out_of_a_container() {
+        use sha2::{Digest, Sha256};
+        let (blob, modules) = container();
+
+        // The container as a whole is not a PE, which is why carving is needed.
+        assert!(analyse_pe(&blob).is_none());
+
+        let carved = carve_pe_modules(&blob);
+        assert_eq!(carved.len(), 3, "one per embedded image");
+
+        let machines: Vec<&str> = carved.iter().map(|m| m.machine.as_str()).collect();
+        assert_eq!(machines, vec!["arm64", "x86", "x64"]);
+
+        let timestamps: Vec<u32> = carved.iter().map(|m| m.timestamp).collect();
+        assert_eq!(
+            timestamps,
+            vec![1_700_000_000, 1_700_000_100, 1_700_000_200]
+        );
+
+        // Each carved slice must be exactly the image that was embedded.
+        for (carved, original) in carved.iter().zip(&modules) {
+            assert_eq!(carved.size, original.len(), "image boundary is exact");
+            assert_eq!(
+                &blob[carved.offset..carved.offset + carved.size],
+                &original[..]
+            );
+            assert_eq!(carved.sha256, hex::encode(Sha256::digest(original)));
+        }
+        assert_eq!(carved[0].offset, 128, "first image follows the header");
+    }
+
+    #[test]
+    fn the_primary_image_supplies_pe_detail_for_a_container() {
+        let (blob, _) = container();
+        let info = analyse_primary_pe(&blob).expect("falls back to the first image");
+        assert_eq!(info.machine, "arm64");
+        assert_eq!(info.timestamp, 1_700_000_000);
+    }
+
+    #[test]
+    fn stray_mz_bytes_are_not_mistaken_for_modules() {
+        let mut blob = b"MZ not a real header at all".to_vec();
+        blob.extend_from_slice(&[0x00; 200]);
+        blob.extend_from_slice(b"MZ");
+        blob.extend_from_slice(&[0xFF; 500]);
+        assert!(carve_pe_modules(&blob).is_empty());
+    }
+
+    #[test]
+    fn carving_a_payload_with_no_images_yields_nothing() {
+        assert!(carve_pe_modules(b"").is_empty());
+        assert!(carve_pe_modules(br#"{"modules":[]}"#).is_empty());
+        assert!(carve_pe_modules(&[0u8; 4096]).is_empty());
     }
 }

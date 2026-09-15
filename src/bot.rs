@@ -5,6 +5,7 @@
 //! options. The operator supplies only a bot token.
 
 use crate::config::Game;
+use crate::eac;
 use crate::embed;
 use crate::settings::{self, MIN_POLL_INTERVAL_SECS};
 use crate::tracker::Tracker;
@@ -107,7 +108,7 @@ impl Handler {
                     CreateCommandOption::new(
                         CommandOptionType::String,
                         "platforms",
-                        "Comma separated, e.g. win64 or win64, win32",
+                        "Comma separated. Defaults to wow64_win64 (Windows x64)",
                     )
                     .required(false),
                 ),
@@ -301,8 +302,8 @@ impl Handler {
         let name = string_option(options, "game").unwrap_or_default();
         let product_id = string_option(options, "product_id").unwrap_or_default();
         let deployment_id = string_option(options, "deployment_id").unwrap_or_default();
-        let platforms_raw =
-            string_option(options, "platforms").unwrap_or_else(|| "win64".to_string());
+        let platforms_raw = string_option(options, "platforms")
+            .unwrap_or_else(|| eac::DEFAULT_PLATFORM.to_string());
 
         // Validate before touching stored state: these values are interpolated
         // straight into a CDN URL.

@@ -42,7 +42,7 @@ impl Finding {
     /// The command to paste into Discord.
     pub fn command(&self) -> String {
         let platforms = if self.platforms.is_empty() {
-            "win64".to_string()
+            crate::eac::DEFAULT_PLATFORM.to_string()
         } else {
             self.platforms.join(", ")
         };
@@ -357,13 +357,14 @@ mod tests {
             source: PathBuf::new(),
             platforms: Vec::new(),
         };
-        assert_eq!(
-            finding.command(),
-            "/eac add game:ARC Raiders product_id:p deployment_id:d platforms:win64"
+        assert!(
+            finding.command().ends_with("platforms:wow64_win64"),
+            "the default is the composite Windows x64 string, got {}",
+            finding.command()
         );
 
-        finding.platforms = vec!["win64".into(), "win32".into()];
-        assert!(finding.command().ends_with("platforms:win64, win32"));
+        finding.platforms = vec!["wow64_win64".into(), "mac64".into()];
+        assert!(finding.command().ends_with("platforms:wow64_win64, mac64"));
     }
 
     #[test]

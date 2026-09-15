@@ -6,7 +6,7 @@ CDN and posts an embed whenever a game's modules change.
 ```
 EAC Update Detected for ARC Raiders
 Game            Platform          Download
-ARC Raiders     win64             22.0 MB
+ARC Raiders     wow64_win64       22.0 MB
 
 Hash
 d6b8cbf936b39c52
@@ -32,18 +32,23 @@ Every `poll_interval_secs`, the bot fetches each configured target and takes the
 SHA-256 of the raw response body. When that digest differs from the one it last
 recorded, it posts an embed and (optionally) attaches the raw response.
 
-### A note on the payload format
+### The payload format
 
-The response format is not publicly documented and Epic has changed it before,
-so **nothing here depends on it**. Change detection is driven purely by hashing
-the raw bytes, which is correct for any format.
+The response is a **binary container**, not a single image. The modules sit at
+offsets inside it, and one response carries several architectures at once —
+which is why a platform segment is a composite like `wow64_win64` rather than
+plain `win64`.
 
-The per-module breakdown (`driver.sys (arm64) — 16.5 MB`) is a best-effort
-enrichment layer on top: `parse_modules` tries JSON first — handling both
-`{"modules": [{"name": …}]}` and `{"driver.sys": {"size": …}}` shapes — and
-falls back to scanning the blob for embedded module filenames. If both come up
-empty you still get a correct update embed, just without the breakdown. If you
-learn the real schema, `src/eac.rs` is the only file that needs to change.
+The bot carves the embedded PE images out of the container and reports each
+one's architecture, size, hash and build timestamp. That is where the
+per-module breakdown in an update embed comes from.
+
+Nothing *depends* on the format, though. Change detection is the SHA-256 of the
+raw body, which is correct whatever the container turns out to be, and module
+extraction degrades in stages: a JSON manifest if there is one, then carved PE
+images, then a plain scan for embedded filenames. If Epic changes the container
+and all three come up empty, updates are still detected and reported correctly —
+just without the breakdown. `src/analysis.rs` is where that would be fixed.
 
 ## Setup
 
@@ -66,7 +71,7 @@ cargo run --release
 /eac add game:ARC Raiders
         product_id:9e8b37541e614575b4de303d2c2e44cf
         deployment_id:35e06571d8ab4de4b98519b624125459
-        platforms:win64
+        platforms:wow64_win64
 ```
 
 That is the whole setup. Settings are stored per server in `settings.json`, so
@@ -100,13 +105,13 @@ ARC Raiders
   deployment_id: 35e06571d8ab4de4b98519b624125459
   source:        .../ARC Raiders/EasyAntiCheat_EOS/Settings.json
 
-  /eac add game:ARC Raiders product_id:9e8b... deployment_id:35e0... platforms:win64
+  /eac add game:ARC Raiders product_id:9e8b... deployment_id:35e0... platforms:wow64_win64
 ```
 
 `--probe` additionally asks the CDN which platforms each deployment actually
 publishes, which is the only reliable way to learn the platform string. Without
-it, `win64` is assumed — it is the common case but still a guess. `--json`
-emits machine-readable output, and `--depth N` bounds the search.
+it, `wow64_win64` is assumed. `--json` emits machine-readable output, and
+`--depth N` bounds the search.
 
 It runs wherever the files are readable: a native Linux Steam install, a Proton
 prefix, or a Windows drive mounted on the server. Games that do not use EAC have
@@ -131,11 +136,11 @@ eac-tracker probe 9e8b37541e614575b4de303d2c2e44cf 35e06571d8ab4de4b98519b624125
 ```
 
 ```
-  win64      live    22.0 MB
-  win32      live    1.0 MB
-  winarm64   not published (HTTP 404)
+  wow64_win64      live    22.0 MB
+  winarm_x64_x64   live    18.4 MB
+  mac64            not published (HTTP 404)
 
-/eac add game:Game Name product_id:9e8b... deployment_id:35e0... platforms:win64, win32
+/eac add game:Game Name product_id:9e8b... deployment_id:35e0... platforms:wow64_win64, winarm_x64_x64
 ```
 
 With no platform argument every candidate is tried. It exits non-zero when
@@ -144,6 +149,37 @@ output. Probing is a HEAD request, so it costs nothing like a download.
 
 You do not need to do this before `/eac add`, which probes the ids itself and
 refuses ones that publish nothing.
+
+### Platform strings
+
+The platform segment is a composite naming a *combination* of targets, not one
+architecture, because a single response bundles several. Known forms:
+
+| Platform | Meaning |
+| --- | --- |
+| `wow64_win64` | Windows x64. The usual default. |
+| `winarm_x64_x64` | Windows on ARM |
+| `mac64` | macOS |
+| `linux32_64` | Linux |
+
+Bare OS types (`win64`, `win32`, `wow64`, `wine64`, `wine32`) appear in EAC's
+own configuration and are tried as fallbacks, but composites are what real
+deployments answer for. `probe` with no platform argument tries all of them.
+
+### Known deployments
+
+Published by others and **not verified against the CDN by this project** —
+`probe` them before trusting them, since deployments get rotated:
+
+| Game | product_id | deployment_id |
+| --- | --- | --- |
+| ARC Raiders | `9e8b37541e614575b4de303d2c2e44cf` | `35e06571d8ab4de4b98519b624125459` |
+| Rust | `429c2212ad284866aee071454c2125b5` | `76796531e86443548754600511f42e9e` |
+| Apex Legends | `5dcd88f4e2094a698ebffa43438edc33` | `47a5a1b2e0f64748a96777920ad97fbd` |
+| Fortnite | `prod-fn` | `62a9473a2dca46b29ccf17577fcf42d7` |
+
+Note Fortnite's product id is not a hex string — ids are opaque, so anything
+that is not a path separator is accepted.
 
 ### Two EAC backends
 
@@ -317,7 +353,7 @@ not. Replies are ephemeral, so configuring the bot does not clutter the channel.
 | Command | Description |
 | --- | --- |
 | `/eac setup channel:<#channel>` | Choose where updates are posted. |
-| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. Each platform is probed first; ones that publish nothing are rejected, not stored. `platforms` defaults to `win64`. |
+| `/eac add game:<name> product_id:<id> deployment_id:<id> platforms:<list>` | Track a game. Each platform is probed first; ones that publish nothing are rejected, not stored. `platforms` defaults to `wow64_win64`. |
 | `/eac remove game:<name>` | Stop tracking a game. |
 | `/eac list` | Games and platforms being tracked. |
 | `/eac config` | This server's current configuration. |

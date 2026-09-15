@@ -9,13 +9,17 @@
 //!
 //! ## On parsing
 //!
-//! The payload format is not publicly documented and Epic has changed it
-//! before, so nothing here *depends* on it. Change detection is driven purely
-//! by the SHA-256 of the raw response body, which is correct for any format.
-//! [`parse_modules`] is a best-effort enrichment pass on top: it tries JSON
-//! first and falls back to scanning the blob for embedded module filenames.
-//! When both come up empty the update still reports correctly, just without
-//! the per-module breakdown.
+//! The response is a binary container, not a bare image: the modules sit at
+//! offsets inside it, and one response carries several architectures at once,
+//! which is why a platform segment is a composite such as `wow64_win64`.
+//!
+//! The format is not documented and Epic has changed it before, so nothing
+//! here *depends* on it. Change detection is driven purely by the SHA-256 of
+//! the raw response body, which is correct for any format. [`parse_modules`]
+//! is a best-effort enrichment pass on top: a JSON manifest first, then PE
+//! images carved out of the container, then a plain scan for embedded
+//! filenames. When all three come up empty the update still reports
+//! correctly, just without the per-module breakdown.
 
 use crate::analysis::{self, Hashes, PeInfo};
 use anyhow::{Context, Result};
@@ -65,7 +69,8 @@ pub struct Snapshot {
     pub format: String,
     pub entropy: f64,
     pub tlsh: Option<String>,
-    /// Populated when the payload is itself a PE image.
+    /// Header detail for the payload's primary PE image, whether the payload
+    /// is a bare PE or a container with one embedded at an offset.
     pub pe: Option<PeInfo>,
 }
 
@@ -94,7 +99,7 @@ impl Snapshot {
             format: analysis::detect_format(body).to_string(),
             entropy: analysis::shannon_entropy(body),
             tlsh: analysis::tlsh(body),
-            pe: analysis::analyse_pe(body),
+            pe: analysis::analyse_primary_pe(body),
             url: String::new(),
             body: body.to_vec(),
             headers: BTreeMap::new(),
@@ -125,10 +130,27 @@ impl Probe {
     }
 }
 
-/// Platform strings worth trying when the right one is unknown. `win64` is by
-/// far the most common; the rest are guesses, and a deployment only answers
-/// for the platforms it actually ships.
-pub const CANDIDATE_PLATFORMS: &[&str] = &["win64", "win32", "winarm64", "mac", "macos", "linux"];
+/// The default platform for a Windows x64 deployment.
+///
+/// Note this is a *composite* string, not `win64`: one response carries the
+/// modules for several architectures at once, so the path segment names the
+/// combination rather than a single target.
+pub const DEFAULT_PLATFORM: &str = "wow64_win64";
+
+/// Platform strings worth trying when the right one is unknown. The composite
+/// forms come first because they are what real deployments use; the bare OS
+/// types follow because a deployment may still answer for one.
+pub const CANDIDATE_PLATFORMS: &[&str] = &[
+    "wow64_win64",
+    "winarm_x64_x64",
+    "mac64",
+    "linux32_64",
+    "win64",
+    "win32",
+    "wow64",
+    "wine64",
+    "wine32",
+];
 
 pub struct Client {
     http: reqwest::Client,
@@ -253,7 +275,7 @@ impl Client {
             format: analysis::detect_format(&body).to_string(),
             entropy: analysis::shannon_entropy(&body),
             tlsh: analysis::tlsh(&body),
-            pe: analysis::analyse_pe(&body),
+            pe: analysis::analyse_primary_pe(&body),
             url,
             body,
             headers,
@@ -264,6 +286,10 @@ impl Client {
 }
 
 /// Best-effort extraction of module entries from a CDN response body.
+///
+/// Tried in order of how much each yields: a JSON manifest, then PE images
+/// carved out of a binary container — which is what the CDN actually serves —
+/// then a plain scan for embedded filenames.
 pub fn parse_modules(body: &[u8]) -> Vec<ModuleEntry> {
     if let Ok(value) = serde_json::from_slice::<Value>(body) {
         let mut found = Vec::new();
@@ -273,6 +299,24 @@ pub fn parse_modules(body: &[u8]) -> Vec<ModuleEntry> {
             return found;
         }
     }
+
+    let carved = analysis::carve_pe_modules(body);
+    if !carved.is_empty() {
+        return carved
+            .iter()
+            .enumerate()
+            .map(|(i, module)| ModuleEntry {
+                name: module
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("module{i}@0x{:x}", module.offset)),
+                arch: Some(module.machine.clone()),
+                size: Some(module.size as u64),
+                hash: Some(module.sha256.clone()),
+            })
+            .collect();
+    }
+
     scan_for_filenames(body)
 }
 
