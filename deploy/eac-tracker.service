@@ -1,0 +1,39 @@
+[Unit]
+Description=EAC module update tracker
+Documentation=https://github.com/agxinoia/DiscordBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eac-tracker
+Group=eac-tracker
+WorkingDirectory=/opt/eac-tracker
+ExecStart=/opt/eac-tracker/eac-tracker
+# Holds DISCORD_TOKEN=...  — keep it chmod 600, root-owned.
+EnvironmentFile=/etc/eac-tracker.env
+Environment=EAC_LOG=info
+Restart=always
+RestartSec=10s
+
+# Hardening: the bot only needs outbound HTTPS and its own state file.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/eac-tracker
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

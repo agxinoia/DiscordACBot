@@ -72,6 +72,64 @@ Both come from the game's own EasyAntiCheat configuration — typically
 config. The pair in `config.example.toml` is ARC Raiders' Win64 deployment,
 taken from the URL above.
 
+## Deploying on Linux
+
+The only build dependencies are a linker and the Rust toolchain. There is no
+OpenSSL or other native library in the dependency graph: TLS is pure-Rust
+rustls and the CA roots are compiled into the binary, so the release build
+links against nothing but `libc`, `libm` and `libgcc_s`.
+
+**Install Rust with rustup, not `apt install rustc`.** This crate uses edition
+2024, which needs Rust 1.85 or newer; the rustc packaged by current Ubuntu
+releases is older than that and will fail to build it.
+
+```sh
+sudo apt update
+sudo apt install -y build-essential git
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+
+git clone https://github.com/agxinoia/DiscordBot.git
+cd DiscordBot
+cargo build --release
+```
+
+Then install the binary, config and credentials:
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin eac-tracker
+sudo install -d -o eac-tracker -g eac-tracker /opt/eac-tracker
+sudo install -o eac-tracker -g eac-tracker -m 755 \
+    target/release/eac-tracker /opt/eac-tracker/
+sudo install -o eac-tracker -g eac-tracker -m 644 \
+    config.toml /opt/eac-tracker/
+
+sudo install -m 600 deploy/eac-tracker.env.example /etc/eac-tracker.env
+sudo $EDITOR /etc/eac-tracker.env        # set DISCORD_TOKEN
+
+sudo install -m 644 deploy/eac-tracker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now eac-tracker
+journalctl -u eac-tracker -f
+```
+
+The unit runs as an unprivileged system user under `ProtectSystem=strict`.
+`ReadWritePaths=/opt/eac-tracker` is what allows `state.json` to be written —
+remove that line and the bot cannot persist digests. If you move
+`tracker.state_path` elsewhere, add that path to `ReadWritePaths` too.
+
+Two things to expect on a first run:
+
+- **Polling does not begin until the gateway connects.** The loop is started
+  from the `ready` event, so a bad token shows up as reconnect warnings with no
+  `state.json` appearing.
+- **Nothing is posted on the first sweep**, because `announce_on_first_seen`
+  defaults to false. Set it true temporarily to confirm the embed renders
+  without waiting for a real EAC update.
+
+If you build on one machine and copy the binary to another, the target needs a
+glibc at least as new as the build host's. Building on the target avoids it.
+
 ## Configuration
 
 | Key | Default | Meaning |
@@ -124,3 +182,4 @@ sighting, a published change, a no-op re-check, and state surviving a restart.
 | `src/tracker.rs` | Poll loop, change detection, posting. |
 | `src/embed.rs` | Embed rendering and attachment chunking. |
 | `src/bot.rs` | Gateway wiring and `/eac`. |
+| `deploy/` | systemd unit and environment file template. |
