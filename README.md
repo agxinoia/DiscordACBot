@@ -120,9 +120,41 @@ grep -ri --include='*.json' --include='*.ini' -e deploymentid -e productid \
   ~/.steam/steam/steamapps/common/<Game>/
 ```
 
-You do not need to verify ids yourself before adding them — `/eac add` probes
-every platform you give it and refuses ids that publish nothing, reporting the
-download size for the ones that work.
+### Checking ids you found elsewhere
+
+For ids from a wiki, a repo or a forum post, check them before trusting them —
+deployments get rotated, and a stale pair looks identical to a good one until it
+silently never updates:
+
+```sh
+eac-tracker probe 9e8b37541e614575b4de303d2c2e44cf 35e06571d8ab4de4b98519b624125459
+```
+
+```
+  win64      live    22.0 MB
+  win32      live    1.0 MB
+  winarm64   not published (HTTP 404)
+
+/eac add game:Game Name product_id:9e8b... deployment_id:35e0... platforms:win64, win32
+```
+
+With no platform argument every candidate is tried. It exits non-zero when
+nothing is published, so it scripts cleanly, and `--json` gives machine-readable
+output. Probing is a HEAD request, so it costs nothing like a download.
+
+You do not need to do this before `/eac add`, which probes the ids itself and
+refuses ones that publish nothing.
+
+### Two EAC backends
+
+This tracker follows the **EOS-based** EAC, distributed from
+`modules-cdn.eac-prod.on.epicgames.com`. Games on the **legacy** backend do not
+publish there and cannot be tracked by this bot, however correct their ids are.
+
+The install layout is the tell: an `EasyAntiCheat_EOS/` folder means EOS, while
+a bare `EasyAntiCheat/` folder is usually legacy. `probe` gives the definitive
+answer — a pair that reports "not published" on every platform is either wrong
+or not on this CDN.
 
 ## The archive
 

@@ -179,14 +179,29 @@ impl Client {
                 .with_context(|| format!("probing {url}"))?;
         }
 
+        let status = resp.status().as_u16();
+        // On a HEAD there is no body, so `content_length()` reports 0 rather
+        // than the advertised size; read the header itself. On a 206 the
+        // Content-Length is the one byte requested, and the full size lives
+        // in the Content-Range total.
+        let header_value = |name: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let ranged_total = header_value(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.rsplit('/').next().and_then(|t| t.parse::<u64>().ok()));
+        let advertised =
+            header_value(reqwest::header::CONTENT_LENGTH).and_then(|v| v.parse::<u64>().ok());
+
         Ok(Probe {
-            content_length: resp.content_length().or_else(|| {
-                resp.headers()
-                    .get(reqwest::header::CONTENT_RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.rsplit('/').next()?.parse().ok())
-            }),
-            status: resp.status().as_u16(),
+            content_length: if status == 206 {
+                ranged_total.or(advertised)
+            } else {
+                advertised.or(ranged_total)
+            },
+            status,
             url,
             platform: platform.to_string(),
         })

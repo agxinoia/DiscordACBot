@@ -16,7 +16,18 @@ eac-tracker — Easy Anti-Cheat module update tracker
 USAGE:
     eac-tracker                        Run the bot (default)
     eac-tracker discover [PATH]...     Find EAC ids in installed games
+    eac-tracker probe ID ID [PLAT]...  Check whether an id pair is live
     eac-tracker --help
+
+PROBE:
+    eac-tracker probe <product_id> <deployment_id> [platform]...
+
+    With no platform, every known candidate is tried. Use it to check ids
+    found on a website before adding them. Exits non-zero if nothing is
+    published for the pair.
+
+    --name NAME      Game name to use in the printed /eac add command
+    --json           Emit JSON instead of a report
 
 DISCOVER OPTIONS:
     --probe          Check which platforms each deployment actually publishes
@@ -30,8 +41,26 @@ ENVIRONMENT:
     DISCORD_TOKEN     Bot token. The only required setting.
     DISCORD_GUILD_ID  Register /eac to one server for instant availability.
     EAC_CONFIG        Optional config file path (default config.toml).
+    EAC_CDN_BASE      Override the module CDN base URL (mirrors, testing).
     EAC_LOG           Log filter, e.g. debug.
 ";
+
+/// The CDN to talk to from the command line. `EAC_CDN_BASE` mirrors the
+/// `tracker.cdn_base` config key the bot uses.
+fn cdn_base() -> String {
+    std::env::var("EAC_CDN_BASE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| eac::CDN_BASE.to_string())
+}
+
+fn probe_client() -> Result<eac::Client> {
+    eac::Client::with_base(
+        &cdn_base(),
+        concat!("eac-tracker/", env!("CARGO_PKG_VERSION")),
+        Duration::from_secs(20),
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +72,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("discover") => run_discover(&args[1..]).await,
+        Some("probe") => run_probe(&args[1..]).await,
         Some(other) if other.starts_with('-') => {
             eprintln!("unknown option `{other}`\n\n{USAGE}");
             std::process::exit(2);
@@ -160,11 +190,7 @@ async fn run_discover(args: &[String]) -> Result<()> {
     }
 
     if probe {
-        let client = eac::Client::with_base(
-            eac::CDN_BASE,
-            "eac-tracker-discover",
-            Duration::from_secs(20),
-        )?;
+        let client = probe_client()?;
         let candidates: Vec<String> = eac::CANDIDATE_PLATFORMS
             .iter()
             .map(|p| (*p).to_string())
@@ -226,6 +252,135 @@ async fn run_discover(args: &[String]) -> Result<()> {
             "Platforms are a guess without --probe; re-run with it to confirm \
              which ones each deployment actually publishes."
         );
+    }
+    Ok(())
+}
+
+/// One platform's probe result, for `--json`.
+#[derive(serde::Serialize)]
+struct ProbeReport {
+    platform: String,
+    url: String,
+    live: bool,
+    status: Option<u16>,
+    size: Option<u64>,
+    error: Option<String>,
+}
+
+async fn run_probe(args: &[String]) -> Result<()> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut as_json = false;
+    let mut name = String::from("Game Name");
+
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--json" => as_json = true,
+            "--name" => {
+                name = rest.next().context("--name needs a value")?.clone();
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown probe option `{other}`\n\n{USAGE}");
+                std::process::exit(2);
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+
+    let [product_id, deployment_id, platforms @ ..] = positional.as_slice() else {
+        eprintln!("usage: eac-tracker probe <product_id> <deployment_id> [platform]...");
+        std::process::exit(2);
+    };
+
+    // Reject malformed ids here rather than sending a doomed request.
+    settings::validate_id("product_id", product_id)?;
+    settings::validate_id("deployment_id", deployment_id)?;
+    let platforms: Vec<String> = if platforms.is_empty() {
+        eac::CANDIDATE_PLATFORMS
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect()
+    } else {
+        for platform in platforms {
+            settings::validate_platform(platform)?;
+        }
+        platforms.to_vec()
+    };
+
+    let client = probe_client()?;
+    let mut reports = Vec::new();
+    let mut live = Vec::new();
+    let mut reachable = false;
+
+    for platform in &platforms {
+        let report = match client.probe(product_id, deployment_id, platform).await {
+            Ok(p) => {
+                reachable = true;
+                if p.ok() {
+                    live.push(platform.clone());
+                }
+                ProbeReport {
+                    platform: platform.clone(),
+                    url: p.url.clone(),
+                    live: p.ok(),
+                    status: Some(p.status),
+                    size: p.content_length,
+                    error: None,
+                }
+            }
+            Err(e) => ProbeReport {
+                platform: platform.clone(),
+                url: eac::module_url_with_base(&cdn_base(), product_id, deployment_id, platform),
+                live: false,
+                status: None,
+                size: None,
+                error: Some(format!("{e:#}")),
+            },
+        };
+        if !as_json {
+            match (&report.error, report.live) {
+                (Some(error), _) => println!("  {:<10} unreachable — {error}", report.platform),
+                (None, true) => println!(
+                    "  {:<10} live    {}",
+                    report.platform,
+                    report
+                        .size
+                        .map(eac_tracker::embed::human_bytes)
+                        .unwrap_or_else(|| "size unknown".into())
+                ),
+                (None, false) => println!(
+                    "  {:<10} not published (HTTP {})",
+                    report.platform,
+                    report.status.unwrap_or(0)
+                ),
+            }
+        }
+        reports.push(report);
+    }
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else if live.is_empty() {
+        println!();
+        if reachable {
+            println!(
+                "Nothing is published for that pair. Check the ids, or the game may \
+                 use the legacy EAC backend (an EasyAntiCheat folder without the \
+                 _EOS suffix) rather than this CDN."
+            );
+        } else {
+            println!("Could not reach the CDN — see the errors above.");
+        }
+    } else {
+        println!();
+        println!(
+            "/eac add game:{name} product_id:{product_id} deployment_id:{deployment_id} platforms:{}",
+            live.join(", ")
+        );
+    }
+
+    if live.is_empty() {
+        std::process::exit(1);
     }
     Ok(())
 }

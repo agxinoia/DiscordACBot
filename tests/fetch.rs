@@ -148,6 +148,8 @@ async fn probe_reports_a_live_target_without_downloading_it() {
     assert_eq!(probe.status, 200);
     assert_eq!(probe.platform, "win64");
     assert!(probe.url.ends_with("/p/d/win64"));
+    // The size comes from the header: a HEAD has no body to measure.
+    assert_eq!(probe.content_length, Some(22_020_096));
 }
 
 #[tokio::test]
