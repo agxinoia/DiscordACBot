@@ -56,7 +56,7 @@ learn the real schema, `src/eac.rs` is the only file that needs to change.
 
 ```sh
 cp config.example.toml config.toml
-$EDITOR config.toml            # set discord.channel_id and your games
+nano config.toml               # set discord.channel_id and your games
 export DISCORD_TOKEN=...       # preferred over putting the token in the file
 cargo run --release
 ```
@@ -152,6 +152,14 @@ cd DiscordBot
 cargo build --release
 ```
 
+Create the config, if you have not already. The service will not start
+without it, so do this before installing the unit:
+
+```sh
+cp config.example.toml config.toml
+nano config.toml               # set discord.channel_id and your games
+```
+
 Then install the binary, config and credentials:
 
 ```sh
@@ -163,8 +171,17 @@ sudo install -o eac-tracker -g eac-tracker -m 644 \
     config.toml /opt/eac-tracker/
 
 sudo install -m 600 deploy/eac-tracker.env.example /etc/eac-tracker.env
-sudo $EDITOR /etc/eac-tracker.env        # set DISCORD_TOKEN
+sudo nano /etc/eac-tracker.env           # set DISCORD_TOKEN
+```
 
+Editing that file is not optional — it ships with a placeholder token. Use a
+concrete editor rather than `sudo $EDITOR`: when `EDITOR` is unset that expands
+to `sudo /etc/eac-tracker.env`, which tries to *execute* the file and fails with
+a permission error.
+
+Finally, install and start the service:
+
+```sh
 sudo install -m 644 deploy/eac-tracker.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now eac-tracker
@@ -175,6 +192,12 @@ The unit runs as an unprivileged system user under `ProtectSystem=strict`.
 `ReadWritePaths=/opt/eac-tracker` is what allows `state.json` to be written —
 remove that line and the bot cannot persist digests. If you move
 `tracker.state_path` elsewhere, add that path to `ReadWritePaths` too.
+
+If the service crash-loops with `no config at /opt/eac-tracker/config.toml`,
+the config was never installed — run the two blocks above, then
+`sudo systemctl restart eac-tracker`. Paths in the log are absolute, and under
+this unit they resolve against `WorkingDirectory=/opt/eac-tracker`, not the
+directory you built in.
 
 Two things to expect on a first run:
 

@@ -5,7 +5,7 @@
 //! `DISCORD_TOKEN` environment variable takes precedence so the config can be
 //! committed or shared without leaking credentials.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -119,10 +119,19 @@ impl Default for Tracker {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config at {}", path.display()))?;
+        // Report an absolute path: under systemd the relative default resolves
+        // against WorkingDirectory, not wherever the operator was standing.
+        let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let raw = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => anyhow!(
+                "no config at {} — copy config.example.toml there, \
+                 then set discord.channel_id and your games",
+                shown.display()
+            ),
+            _ => anyhow::Error::new(e).context(format!("reading config at {}", shown.display())),
+        })?;
         let mut cfg: Config =
-            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+            toml::from_str(&raw).with_context(|| format!("parsing {}", shown.display()))?;
 
         if let Ok(token) = std::env::var("DISCORD_TOKEN")
             && !token.trim().is_empty()
@@ -209,6 +218,23 @@ platforms = ["win64"]
         let raw = include_str!("../config.example.toml");
         let cfg: Config = toml::from_str(raw).expect("example config must parse");
         assert!(!cfg.games.is_empty(), "example must configure a game");
+    }
+
+    #[test]
+    fn a_missing_config_names_the_absolute_path_and_the_fix() {
+        // Relative paths resolve against systemd's WorkingDirectory, so the
+        // error has to say where it actually looked.
+        let err = Config::load(Path::new("definitely-not-here.toml"))
+            .expect_err("a missing config is an error")
+            .to_string();
+
+        assert!(err.contains("no config at"), "got: {err}");
+        assert!(err.contains('/'), "path must be absolute, got: {err}");
+        assert!(err.contains("definitely-not-here.toml"), "got: {err}");
+        assert!(
+            err.contains("config.example.toml"),
+            "must say how to fix it: {err}"
+        );
     }
 
     #[test]
