@@ -3,3 +3,4 @@ config.toml
 state.json
 state.json.tmp
 *.bin
+/archive

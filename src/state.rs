@@ -4,6 +4,7 @@
 //! the file is written atomically (temp file + rename) to survive a crash
 //! mid-write.
 
+use crate::eac::{ModuleEntry, Snapshot};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +17,12 @@ pub struct Seen {
     pub size: u64,
     /// Unix seconds.
     pub seen_at: u64,
+    /// Retained so the next change can be described, not just detected.
+    /// Defaulted so state files written before diffing still load.
+    #[serde(default)]
+    pub modules: Vec<ModuleEntry>,
+    #[serde(default)]
+    pub pe_timestamp: Option<u32>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -65,13 +72,15 @@ impl Store {
         self.state.targets.get(key)
     }
 
-    pub fn record(&mut self, key: &str, digest: &str, size: u64) {
+    pub fn record(&mut self, key: &str, snapshot: &Snapshot) {
         self.state.targets.insert(
             key.to_string(),
             Seen {
-                digest: digest.to_string(),
-                size,
+                digest: snapshot.digest().to_string(),
+                size: snapshot.size(),
                 seen_at: now_unix(),
+                modules: snapshot.modules.clone(),
+                pe_timestamp: snapshot.pe.as_ref().map(|p| p.timestamp),
             },
         );
     }
@@ -124,13 +133,16 @@ mod tests {
 
         let mut store = Store::load(&path).unwrap();
         let key = target_key("prod", "deploy", "win64");
-        store.record(&key, "d6b8cbf936b39c52", 22_020_096);
+        let body = br#"{"modules":[{"name":"driver.sys","size":10,"hash":"aa"}]}"#;
+        store.record(&key, &crate::eac::Snapshot::for_test(body));
         store.save().unwrap();
 
         let reloaded = Store::load(&path).unwrap();
         let seen = reloaded.get(&key).expect("entry persisted");
-        assert_eq!(seen.digest, "d6b8cbf936b39c52");
-        assert_eq!(seen.size, 22_020_096);
+        assert_eq!(seen.digest, crate::analysis::hashes(body).sha256);
+        assert_eq!(seen.size, body.len() as u64);
+        assert_eq!(seen.modules.len(), 1, "modules persist for later diffing");
+        assert_eq!(seen.modules[0].name, "driver.sys");
 
         std::fs::remove_file(&path).unwrap();
     }

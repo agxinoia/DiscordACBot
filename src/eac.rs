@@ -17,9 +17,11 @@
 //! When both come up empty the update still reports correctly, just without
 //! the per-module breakdown.
 
+use crate::analysis::{self, Hashes, PeInfo};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub const CDN_BASE: &str = "https://modules-cdn.eac-prod.on.epicgames.com/modules";
@@ -37,7 +39,7 @@ pub fn module_url_with_base(
 }
 
 /// One module named inside a CDN response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleEntry {
     pub name: String,
     pub arch: Option<String>,
@@ -50,11 +52,21 @@ pub struct ModuleEntry {
 pub struct Snapshot {
     pub url: String,
     pub body: Vec<u8>,
-    /// Full SHA-256 of `body`, lowercase hex. The change-detection signal.
-    pub digest: String,
+    /// MD5, SHA-1 and SHA-256, full length. SHA-256 is the change-detection
+    /// signal; the others exist to cross-reference external sample databases.
+    pub hashes: Hashes,
+    /// Every response header, lowercased. Retained in full because CDN headers
+    /// are cheap to capture now and impossible to reconstruct later.
+    pub headers: BTreeMap<String, String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub modules: Vec<ModuleEntry>,
+    /// Container format guessed from magic bytes.
+    pub format: String,
+    pub entropy: f64,
+    pub tlsh: Option<String>,
+    /// Populated when the payload is itself a PE image.
+    pub pe: Option<PeInfo>,
 }
 
 impl Snapshot {
@@ -62,9 +74,33 @@ impl Snapshot {
         self.body.len() as u64
     }
 
+    /// Full SHA-256, lowercase hex.
+    pub fn digest(&self) -> &str {
+        &self.hashes.sha256
+    }
+
     /// First 16 hex chars of the digest — what the embed displays.
     pub fn short_digest(&self) -> &str {
-        short_hash(&self.digest)
+        short_hash(self.digest())
+    }
+
+    /// Build a snapshot straight from bytes, as though they had been fetched.
+    /// Used by tests in other modules and by nothing else.
+    #[doc(hidden)]
+    pub fn for_test(body: &[u8]) -> Self {
+        Self {
+            hashes: analysis::hashes(body),
+            modules: parse_modules(body),
+            format: analysis::detect_format(body).to_string(),
+            entropy: analysis::shannon_entropy(body),
+            tlsh: analysis::tlsh(body),
+            pe: analysis::analyse_pe(body),
+            url: String::new(),
+            body: body.to_vec(),
+            headers: BTreeMap::new(),
+            etag: None,
+            last_modified: None,
+        }
     }
 }
 
@@ -109,14 +145,19 @@ impl Client {
             .with_context(|| format!("requesting {url}"))?;
 
         let status = resp.status();
-        let header = |name: reqwest::header::HeaderName| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        };
-        let etag = header(reqwest::header::ETAG);
-        let last_modified = header(reqwest::header::LAST_MODIFIED);
+        // Headers must be taken before the body, which consumes the response.
+        let headers: BTreeMap<String, String> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let etag = headers.get("etag").cloned();
+        let last_modified = headers.get("last-modified").cloned();
 
         let body = resp
             .bytes()
@@ -128,16 +169,18 @@ impl Client {
             anyhow::bail!("{url} returned HTTP {status}");
         }
 
-        let digest = hex::encode(Sha256::digest(&body));
-        let modules = parse_modules(&body);
-
         Ok(Snapshot {
+            hashes: analysis::hashes(&body),
+            modules: parse_modules(&body),
+            format: analysis::detect_format(&body).to_string(),
+            entropy: analysis::shannon_entropy(&body),
+            tlsh: analysis::tlsh(&body),
+            pe: analysis::analyse_pe(&body),
             url,
             body,
-            digest,
+            headers,
             etag,
             last_modified,
-            modules,
         })
     }
 }

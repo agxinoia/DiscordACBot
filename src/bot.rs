@@ -171,6 +171,7 @@ impl Handler {
                     platform,
                     &outcome.snapshot,
                     outcome.changed,
+                    outcome.diff.as_ref(),
                     max_part,
                 )),
                 Err(e) => errors.push(format!("`{platform}`: {e}")),

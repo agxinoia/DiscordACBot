@@ -5,16 +5,23 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+cms = "0.2.3"
+der = { version = "0.7", features = ["oid"] }
+goblin = { version = "0.10.7", default-features = false, features = ["pe32", "pe64", "std", "alloc", "endian_fd"] }
 hex = "0.4.3"
+md-5 = "0.11.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "http2", "charset"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "builder", "cache"] }
+sha1 = "0.11.0"
 sha2 = "0.11.0"
+tlsh2 = { version = "1.1.0", features = ["diff"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "time", "fs"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+x509-cert = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["net", "rt-multi-thread", "macros", "io-util"] }

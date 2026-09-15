@@ -72,6 +72,64 @@ Both come from the game's own EasyAntiCheat configuration — typically
 config. The pair in `config.example.toml` is ARC Raiders' Win64 deployment,
 taken from the URL above.
 
+## The archive
+
+Change detection alone is lossy: once a new payload lands, the bytes it
+replaced are gone. The archive keeps every distinct payload so history can be
+diffed after the fact.
+
+```
+archive/
+  index.jsonl              # one JSON object per fetch, append-only
+  blobs/<xx>/<sha256>.bin  # payloads, sharded by the first byte of the digest
+```
+
+Blobs are content-addressed, so an unchanged payload is never stored twice, and
+each index record carries `previous_sha256` to chain a payload to the one it
+replaced. Each record holds the full MD5/SHA-1/SHA-256, the TLSH fuzzy hash,
+the detected container format, Shannon entropy, **every response header**, the
+parsed module list, and the PE metadata below.
+
+The archive grows without bound; it is a corpus, not a cache. Prune it yourself
+if disk matters, but note that deleting a blob costs the TLSH distance on the
+next update — tlsh2 cannot rebuild a comparable hash from a stored string, so
+measuring how far a build moved requires the previous payload's actual bytes.
+
+## What gets extracted
+
+Beyond "the hash changed", each update reports as much as the payload allows.
+All of it is best-effort and never fails a poll.
+
+**Always**
+- Full MD5, SHA-1 and SHA-256, untruncated, for cross-referencing external
+  sample databases.
+- TLSH fuzzy hash, and the distance from the previous payload: 0 is identical,
+  under ~30 a small patch, over ~200 effectively unrelated. This is what tells
+  you whether an update is worth opening before you open it.
+- Container format from magic bytes, and Shannon entropy — a packer appearing
+  or disappearing shows up here first.
+- Every response header. `Last-Modified` is the closest thing the CDN gives to
+  a publish timestamp.
+
+**When the payload is a PE image**
+- COFF `TimeDateStamp`, the single most useful field for correlating a build
+  against other artifacts, and reported as a rebuild when it moves.
+- Machine type, which is what actually makes the platform concrete (`arm64`
+  versus `x64`), subsystem, image base, export count.
+- The CodeView PDB path, i.e. the build machine's source layout.
+- Per-section raw size and entropy.
+- Imported DLLs.
+- `VS_VERSIONINFO`: file and product versions plus CompanyName,
+  OriginalFilename and the rest of StringFileInfo.
+- Authenticode certificates from the attribute certificate table: signer
+  subject, issuer, serial and validity window. A signing-certificate rotation
+  is a notable event in its own right.
+
+If the payload turns out to be an encrypted or custom container rather than a
+PE or an archive of them, the PE layer simply reports nothing and the rest
+still works. Identifying that container would be the next step, and
+`src/analysis.rs` is where it would go.
+
 ## Deploying on Linux
 
 The only build dependencies are a linker and the Rust toolchain. There is no
@@ -142,6 +200,7 @@ glibc at least as new as the build host's. Building on the target avoids it.
 | `tracker.attach_raw_response` | `true` | Attach the raw CDN response to the embed. |
 | `tracker.max_attachment_bytes` | `9500000` | Upload chunk size, just under Discord's 10 MB per-file limit. Bodies larger than this are split into numbered parts (max 10 per message). |
 | `tracker.state_path` | `state.json` | Where last-seen digests are persisted. |
+| `tracker.archive_path` | `archive` | Payload archive directory. `""` disables it, which also disables TLSH distance. |
 | `tracker.thumbnail_url` | unset | Image shown in the embed's corner. |
 | `tracker.cdn_base` | official CDN | Override for mirrors and testing. |
 
@@ -178,6 +237,9 @@ sighting, a published change, a no-op re-check, and state surviving a restart.
 | File | Responsibility |
 | --- | --- |
 | `src/eac.rs` | CDN client, hashing, module parsing. |
+| `src/analysis.rs` | Hashes, entropy, TLSH, PE and Authenticode parsing. |
+| `src/archive.rs` | Content-addressed payload store and JSONL index. |
+| `src/diff.rs` | What changed between two payloads. |
 | `src/state.rs` | Persisted last-seen digests. |
 | `src/tracker.rs` | Poll loop, change detection, posting. |
 | `src/embed.rs` | Embed rendering and attachment chunking. |

@@ -59,6 +59,11 @@ pub struct Tracker {
     /// [`crate::eac::CDN_BASE`].
     #[serde(default)]
     pub cdn_base: Option<String>,
+    /// Directory for the payload archive. Set to "" to disable archiving,
+    /// which also disables TLSH distance in update embeds, since measuring it
+    /// requires the previous payload's bytes.
+    #[serde(default = "defaults::archive_path")]
+    pub archive_path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -87,6 +92,9 @@ mod defaults {
     pub fn state_path() -> String {
         "state.json".to_string()
     }
+    pub fn archive_path() -> String {
+        "archive".to_string()
+    }
     pub fn user_agent() -> String {
         concat!("eac-tracker/", env!("CARGO_PKG_VERSION")).to_string()
     }
@@ -104,6 +112,7 @@ impl Default for Tracker {
             user_agent: defaults::user_agent(),
             thumbnail_url: None,
             cdn_base: None,
+            archive_path: defaults::archive_path(),
         }
     }
 }
@@ -192,6 +201,7 @@ platforms = ["win64"]
         assert!(cfg.tracker.attach_raw_response);
         assert_eq!(cfg.tracker.state_path, "state.json");
         assert!(cfg.tracker.cdn_base.is_none());
+        assert_eq!(cfg.tracker.archive_path, "archive");
     }
 
     #[test]

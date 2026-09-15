@@ -79,7 +79,7 @@ async fn fetches_digests_and_parses_a_json_manifest() {
     );
 
     // The digest must match an independent SHA-256 of the same bytes.
-    assert_eq!(snapshot.digest, hex::encode(Sha256::digest(BODY)));
+    assert_eq!(snapshot.digest(), hex::encode(Sha256::digest(BODY)));
     assert_eq!(snapshot.short_digest().len(), 16);
 
     assert_eq!(snapshot.modules.len(), 1);
@@ -105,8 +105,8 @@ async fn identical_bodies_digest_identically_and_changed_ones_do_not() {
         .await
         .unwrap();
 
-    assert_eq!(first.digest, same.digest);
-    assert_ne!(first.digest, different.digest);
+    assert_eq!(first.digest(), same.digest());
+    assert_ne!(first.digest(), different.digest());
 }
 
 #[tokio::test]

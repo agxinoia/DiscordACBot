@@ -18,6 +18,11 @@ announce_on_first_seen = false
 attach_raw_response = true
 max_attachment_bytes = 9500000
 state_path = "state.json"
+# Directory for the payload archive: every distinct payload is kept under its
+# SHA-256, with an append-only index.jsonl describing each fetch. Set to "" to
+# disable, which also disables TLSH distance in update embeds, since measuring
+# how far a build moved needs the previous payload's bytes.
+archive_path = "archive"
 # thumbnail_url = "https://example.invalid/eac-logo.png"
 
 # Product and deployment ids come from the game's EasyAntiCheat settings;

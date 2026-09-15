@@ -1,10 +1,12 @@
 //! Polling engine: fetch every configured target, compare against the last
 //! seen digest, and post an embed when it moves.
 
+use crate::archive::{Archive, Record};
 use crate::config::{Config, Game};
+use crate::diff::{self, Diff};
 use crate::eac::{self, Snapshot};
 use crate::embed;
-use crate::state::{Store, target_key};
+use crate::state::{Seen, Store, now_unix, target_key};
 use anyhow::{Context, Result};
 use serenity::builder::{CreateAttachment, CreateMessage};
 use serenity::http::Http;
@@ -24,6 +26,9 @@ pub struct Outcome {
     pub changed: bool,
     /// This target had no recorded digest at all.
     pub first_seen: bool,
+    /// What moved. Present only on a real change, and only as far as the
+    /// available history allows.
+    pub diff: Option<Diff>,
 }
 
 impl Outcome {
@@ -36,6 +41,8 @@ pub struct Tracker {
     config: Arc<Config>,
     client: eac::Client,
     store: Mutex<Store>,
+    /// `None` when archiving is switched off, which also costs TLSH distance.
+    archive: Option<Archive>,
 }
 
 impl Tracker {
@@ -46,10 +53,14 @@ impl Tracker {
             Duration::from_secs(config.tracker.request_timeout_secs),
         )?;
         let store = Store::load(std::path::Path::new(&config.tracker.state_path))?;
+        let archive = Some(config.tracker.archive_path.trim())
+            .filter(|p| !p.is_empty())
+            .map(Archive::new);
         Ok(Self {
             config,
             client,
             store: Mutex::new(store),
+            archive,
         })
     }
 
@@ -82,30 +93,86 @@ impl Tracker {
             .await?;
         let key = target_key(&game.product_id, &game.deployment_id, platform);
 
-        // Kept free of `.await` so the std mutex is never held across a yield.
-        let (previous, changed, first_seen) = {
-            let mut store = self.store.lock().expect("state lock poisoned");
-            let previous = store.get(&key).map(|s| s.digest.clone());
-            let first_seen = previous.is_none();
-            let changed = previous.as_deref().is_some_and(|p| p != snapshot.digest);
+        // Each lock scope is kept free of `.await` so the std mutex is never
+        // held across a yield.
+        let previous: Option<Seen> = {
+            let store = self.store.lock().expect("state lock poisoned");
+            store.get(&key).cloned()
+        };
+        let first_seen = previous.is_none();
+        let changed = previous
+            .as_ref()
+            .is_some_and(|p| p.digest != snapshot.digest());
 
-            if first_seen || changed {
-                store.record(&key, &snapshot.digest, snapshot.size());
+        // Describing the change needs the bytes it replaced, which only the
+        // archive has; without it the diff is still produced, just thinner.
+        let diff = previous.as_ref().filter(|_| changed).map(|prev| {
+            let previous_body = self
+                .archive
+                .as_ref()
+                .and_then(|a| a.load(&prev.digest).ok().flatten());
+            diff::compute(prev, &snapshot, previous_body.as_deref())
+        });
+
+        if first_seen || changed {
+            {
+                let mut store = self.store.lock().expect("state lock poisoned");
+                store.record(&key, &snapshot);
                 if let Err(e) = store.save() {
                     // A failed save costs a duplicate announcement next cycle,
                     // which is better than dropping the update entirely.
                     error!(target = %key, error = ?e, "failed to persist state");
                 }
             }
-            (previous, changed, first_seen)
-        };
+            self.archive_snapshot(game, platform, &snapshot, previous.as_ref());
+        }
 
         Ok(Outcome {
             snapshot,
-            previous,
+            previous: previous.map(|p| p.digest),
             changed,
             first_seen,
+            diff,
         })
+    }
+
+    /// Retain the payload and append an index record. Archiving is never
+    /// allowed to fail a poll — a lost archive entry is worth less than a
+    /// missed notification.
+    fn archive_snapshot(
+        &self,
+        game: &Game,
+        platform: &str,
+        snapshot: &Snapshot,
+        previous: Option<&Seen>,
+    ) {
+        let Some(archive) = &self.archive else {
+            return;
+        };
+        if let Err(e) = archive.store(snapshot.digest(), &snapshot.body) {
+            warn!(game = %game.name, error = ?e, "failed to archive payload");
+            return;
+        }
+        let record = Record {
+            seen_at: now_unix(),
+            game: game.name.clone(),
+            product_id: game.product_id.clone(),
+            deployment_id: game.deployment_id.clone(),
+            platform: platform.to_string(),
+            url: snapshot.url.clone(),
+            size: snapshot.size(),
+            hashes: snapshot.hashes.clone(),
+            tlsh: snapshot.tlsh.clone(),
+            format: snapshot.format.clone(),
+            entropy: snapshot.entropy,
+            headers: snapshot.headers.clone().into_iter().collect(),
+            modules: snapshot.modules.clone(),
+            pe: snapshot.pe.clone(),
+            previous_sha256: previous.map(|p| p.digest.clone()),
+        };
+        if let Err(e) = archive.append(&record) {
+            warn!(game = %game.name, error = ?e, "failed to append archive index");
+        }
     }
 
     /// Check every configured target once, announcing the ones that moved.
@@ -172,6 +239,7 @@ impl Tracker {
             platform,
             &outcome.snapshot,
             outcome.previous.as_deref(),
+            outcome.diff.as_ref(),
             tracker.max_attachment_bytes,
             tracker.attach_raw_response,
             tracker.thumbnail_url.as_deref(),
@@ -258,17 +326,11 @@ mod tests {
 
     fn outcome(changed: bool, first_seen: bool) -> Outcome {
         Outcome {
-            snapshot: Snapshot {
-                url: String::new(),
-                body: Vec::new(),
-                digest: String::new(),
-                etag: None,
-                last_modified: None,
-                modules: Vec::new(),
-            },
+            snapshot: Snapshot::for_test(b""),
             previous: None,
             changed,
             first_seen,
+            diff: None,
         }
     }
 
