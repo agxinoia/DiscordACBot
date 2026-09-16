@@ -1,8 +1,8 @@
 //! In-Discord dashboard and preset insight view builders.
 //!
-//! Provides interactive embeds and Discord components (buttons and select
-//! menus) for configuring channel routing, tracker settings, and exploring
-//! rich preset insights for known EAC games.
+//! Provides clean, minimalist embeds and components for configuring channel
+//! routing, tracker options with detailed setting explanations, and inspecting
+//! built-in preset insights for known EAC games.
 
 use crate::catalog::{self, KnownGame};
 use crate::config::Game;
@@ -14,6 +14,11 @@ use serenity::all::{
     ButtonStyle, ChannelType, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
     CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, Timestamp,
 };
+
+/// Clean muted theme colors for minimalist UI.
+const COLOR_NEUTRAL: u32 = 0x2B2D31;
+const COLOR_ACTIVE: u32 = 0x57F287;
+const COLOR_INFO: u32 = 0x5865F2;
 
 /// Build the primary dashboard control panel view.
 pub fn build_main_dashboard(
@@ -27,9 +32,7 @@ pub fn build_main_dashboard(
 
     let channel_text = match guild.channel_id.or(config.discord.channel_id) {
         Some(cid) => format!("<#{cid}>"),
-        None => {
-            "⚠️ **Not configured!** (Select a channel below to receive update alerts)".to_string()
-        }
+        None => "Not configured (select a channel below)".to_string(),
     };
 
     let first_seen_opt = guild
@@ -41,8 +44,7 @@ pub fn build_main_dashboard(
     let poll_interval = tracker.poll_interval();
 
     let games_summary = if tracked_games.is_empty() {
-        "*No games tracked yet. Pick a preset from the menu below or click '🚀 Track All Presets' to get started.*"
-            .to_string()
+        "*None configured yet. Choose a preset below or click 'Track All Presets'.*".to_string()
     } else {
         tracked_games
             .iter()
@@ -67,46 +69,48 @@ pub fn build_main_dashboard(
         .iter()
         .map(|k| {
             let status = if k.is_tracked(&tracked_games) {
-                "✅ Tracked"
+                "[Tracked]"
             } else {
-                "⚪ Available"
+                "[Available]"
             };
-            format!("• **{}** ({}) — *{}*", k.name, k.publisher, status)
+            format!("• **{}** ({}) — {}", k.name, k.publisher, status)
         })
         .collect::<Vec<_>>()
         .join("\n");
 
     let embed = CreateEmbed::new()
-        .title("🛡️ EAC Tracker — Control Panel & Dashboard")
+        .title("EAC Tracker — Configuration Dashboard")
         .description(
-            "Real-time configuration dashboard for Easy Anti-Cheat module monitoring. \
-             Use the dropdowns and buttons below to manage alert channels, tracker \
-             settings, or explore built-in presets.",
+            "Manage alert channels, tracker options, and explore built-in deployment presets. \
+             Each setting is documented below.",
         )
-        .color(0x5865F2)
-        .field("📢 Announcement Channel", channel_text, false)
+        .color(COLOR_NEUTRAL)
         .field(
-            format!("🎯 Tracked Games ({})", tracked_games.len()),
+            "Announce Channel",
+            format!(
+                "**Current:** {}\n\
+                 Destination channel where module updates, binary change digests, and carved PE metadata are posted.",
+                channel_text
+            ),
+            false,
+        )
+        .field(
+            format!("Tracked Games ({})", tracked_games.len()),
             games_summary,
             false,
         )
         .field(
-            "⚙️ Tracker Settings",
+            "Tracker Settings & Explanations",
             format!(
-                "• **First-Seen Sighting**: {}\n\
-                 • **Attach Raw Payload**: {}\n\
-                 • **Poll Sweep Interval**: `{}s` ({} min) *(bot-wide)*\n\
+                "• **First-Seen Sighting** (`announce_on_first_seen`): **{}**\n  \
+                 *Whether to post an embed when a target is first observed. Disabled by default so starting the bot records quiet baselines instead of announcing every existing module.*\n\n\
+                 • **Raw Payload Attachment** (`attach_raw_response`): **{}**\n  \
+                 *Uploads the raw CDN container alongside update embeds for offline inspection (automatically split if larger than 9.5 MB).*\n\n\
+                 • **Poll Interval** (`poll_interval_secs`): **{}s** ({} min, bot-wide)\n  \
+                 *Delay between CDN polling sweeps across all targets. Enforces a 30-second floor to remain polite to the CDN.*\n\n\
                  • **Active Endpoints**: `{} target(s)` polled across bot",
-                if first_seen_opt {
-                    "🔔 **Enabled**"
-                } else {
-                    "🔕 **Disabled** (quiet baseline)"
-                },
-                if attach_raw_opt {
-                    "📎 **Enabled** (split >9.5MB)"
-                } else {
-                    "❌ **Disabled**"
-                },
+                if first_seen_opt { "Enabled" } else { "Disabled" },
+                if attach_raw_opt { "Enabled" } else { "Disabled" },
                 poll_interval,
                 poll_interval / 60,
                 tracker.target_count()
@@ -114,15 +118,15 @@ pub fn build_main_dashboard(
             false,
         )
         .field(
-            format!("💡 Known Game Presets Inside ({})", catalog::KNOWN.len()),
+            format!("Built-In Game Presets ({})", catalog::KNOWN.len()),
             format!(
-                "{presets_overview}\n\n*Select any game from the Preset dropdown below to view \
-                 architectural insights, CDN endpoints, live probe results, or to track with 1 click.*"
+                "{presets_overview}\n\n\
+                 *Select a game below to view architecture insights, CDN endpoints, live probe results, or to track.*"
             ),
             false,
         )
         .footer(CreateEmbedFooter::new(
-            "EAC Module Tracker • Built-in Presets & Insights",
+            "EAC Module Tracker • Minimalist Dashboard",
         ))
         .timestamp(Timestamp::now());
 
@@ -134,12 +138,12 @@ pub fn build_main_dashboard(
         .map(|k| {
             let is_tracked = k.is_tracked(&tracked_games);
             let status_desc = if is_tracked {
-                "✅ Tracked • Inspect details"
+                "Tracked • View insights"
             } else {
-                "⚪ Available • Inspect & track"
+                "Available • View insights & track"
             };
             CreateSelectMenuOption::new(k.name, k.name)
-                .description(format!("{} • {}", k.publisher, status_desc))
+                .description(format!("{} — {}", k.publisher, status_desc))
         })
         .collect();
 
@@ -150,7 +154,7 @@ pub fn build_main_dashboard(
                 options: preset_options,
             },
         )
-        .placeholder("🎮 Explore Known Game Presets & Insights..."),
+        .placeholder("Select a known game preset for insights..."),
     ));
 
     // Row 2: Tracked Games Select Menu (if any tracked)
@@ -180,7 +184,7 @@ pub fn build_main_dashboard(
                     options: tracked_options,
                 },
             )
-            .placeholder("🎯 Manage Tracked Game (Check / Remove)..."),
+            .placeholder("Select a tracked game to manage..."),
         ));
     }
 
@@ -193,15 +197,15 @@ pub fn build_main_dashboard(
                 default_channels: None,
             },
         )
-        .placeholder("📢 Set Announcement Channel..."),
+        .placeholder("Select announcement channel..."),
     ));
 
     // Row 4: Toggle Buttons
     let btn_first_seen = CreateButton::new("dash:btn:toggle_first_seen")
         .label(if first_seen_opt {
-            "🔔 First Seen: ON"
+            "First-Seen: Enabled"
         } else {
-            "🔕 First Seen: OFF"
+            "First-Seen: Disabled"
         })
         .style(if first_seen_opt {
             ButtonStyle::Success
@@ -211,9 +215,9 @@ pub fn build_main_dashboard(
 
     let btn_attach_raw = CreateButton::new("dash:btn:toggle_raw")
         .label(if attach_raw_opt {
-            "📎 Raw Attach: ON"
+            "Raw Payload: Attached"
         } else {
-            "❌ Raw Attach: OFF"
+            "Raw Payload: Omitted"
         })
         .style(if attach_raw_opt {
             ButtonStyle::Success
@@ -222,7 +226,7 @@ pub fn build_main_dashboard(
         });
 
     let btn_cycle_poll = CreateButton::new("dash:btn:cycle_poll")
-        .label(format!("⏱️ Interval: {}s", poll_interval))
+        .label(format!("Interval: {}s", poll_interval))
         .style(ButtonStyle::Primary);
 
     rows.push(CreateActionRow::Buttons(vec![
@@ -233,15 +237,15 @@ pub fn build_main_dashboard(
 
     // Row 5: Action Buttons
     let btn_refresh = CreateButton::new("dash:btn:refresh")
-        .label("🔄 Refresh")
-        .style(ButtonStyle::Primary);
+        .label("Refresh")
+        .style(ButtonStyle::Secondary);
 
     let btn_add_all = CreateButton::new("dash:btn:add_all_presets")
-        .label("🚀 Track All Presets")
-        .style(ButtonStyle::Success);
+        .label("Track All Presets")
+        .style(ButtonStyle::Primary);
 
     let btn_status = CreateButton::new("dash:btn:view_status")
-        .label("📊 System Status")
+        .label("Status")
         .style(ButtonStyle::Secondary);
 
     rows.push(CreateActionRow::Buttons(vec![
@@ -272,7 +276,7 @@ pub fn build_preset_insight(
 
     let tracking_status_text = if let Some(g) = tracked_entry {
         format!(
-            "✅ **Active in this server**\nConfigured platforms: {}",
+            "Tracked in this server\nPlatforms: {}",
             g.platforms
                 .iter()
                 .map(|p| format!("`{p}`"))
@@ -280,7 +284,7 @@ pub fn build_preset_insight(
                 .join(", ")
         )
     } else {
-        "⚪ **Not currently tracked in this server**\nClick **Track Preset** below to auto-probe the CDN and start monitoring."
+        "Not currently tracked in this server. Click 'Track Preset' below to probe and monitor."
             .to_string()
     };
 
@@ -292,23 +296,23 @@ pub fn build_preset_insight(
         .join(", ");
 
     let mut embed = CreateEmbed::new()
-        .title(format!("🔍 Preset Insight: {}", game.name))
+        .title(format!("Preset Insight: {}", game.name))
         .description(format!(
-            "**Publisher / Studio:** {}\n\n{}\n\n**Typical Platforms:** {}",
+            "**Developer / Publisher:** {}\n\n{}\n\n**Typical Platforms:** {}",
             game.publisher, game.insight, typical_platforms_str
         ))
-        .color(if is_tracked { 0x2ECC71 } else { 0xF1C40F })
-        .field("📊 Tracking Status", tracking_status_text, false)
+        .color(if is_tracked { COLOR_ACTIVE } else { COLOR_INFO })
+        .field("Status", tracking_status_text, false)
         .field(
-            "🏷️ Epic CDN Identifiers",
+            "Identifiers",
             format!(
-                "• **Product ID**: `{}`\n• **Deployment ID**: `{}`",
+                "• Product ID: `{}`\n• Deployment ID: `{}`",
                 game.product_id, game.deployment_id
             ),
             false,
         )
         .field(
-            "🌐 CDN Endpoint Base",
+            "CDN URL Template",
             format!(
                 "`https://modules-cdn.eac-prod.on.epicgames.com/modules/{}/{}/{{platform}}`",
                 game.product_id, game.deployment_id
@@ -325,23 +329,23 @@ pub fn build_preset_insight(
                         .content_length
                         .map(embed::human_bytes)
                         .unwrap_or_else(|| "unknown size".to_string());
-                    probe_lines.push(format!("• `{platform}`: 🟢 **Live Module** ({size_str})"));
+                    probe_lines.push(format!("• `{platform}`: Live module ({size_str})"));
                 }
                 Ok(p) if p.is_module() && p.suspicious() => {
                     let size_str = p
                         .content_length
                         .map(embed::human_bytes)
                         .unwrap_or_else(|| "unknown size".to_string());
-                    probe_lines.push(format!("• `{platform}`: ⚠️ **Stub Endpoint** ({size_str})"));
+                    probe_lines.push(format!("• `{platform}`: Stub endpoint ({size_str}, skipped by default)"));
                 }
                 Ok(p) if p.ok() => {
-                    probe_lines.push(format!("• `{platform}`: ⚪ *Empty (0 B / not published)*"));
+                    probe_lines.push(format!("• `{platform}`: Not published (0 B)"));
                 }
                 Ok(p) => {
-                    probe_lines.push(format!("• `{platform}`: ⚪ *HTTP {}*", p.status));
+                    probe_lines.push(format!("• `{platform}`: HTTP {}", p.status));
                 }
                 Err(e) => {
-                    probe_lines.push(format!("• `{platform}`: ❌ *Error: {e}*"));
+                    probe_lines.push(format!("• `{platform}`: Error: {e}"));
                 }
             }
         }
@@ -350,18 +354,18 @@ pub fn build_preset_insight(
         } else {
             probe_lines.join("\n")
         };
-        embed = embed.field("⚡ Live CDN Probe Results", probe_summary, false);
+        embed = embed.field("Live CDN Probe Results", probe_summary, false);
     } else {
         embed = embed.field(
-            "⚡ Live CDN Probe",
-            "*Click \"⚡ Probe CDN Now\" below to test candidate platforms against the live Epic CDN in real time.*",
+            "Live CDN Probe",
+            "Click 'Probe CDN' below to query the live Epic Games CDN endpoints and verify published modules.",
             false,
         );
     }
 
     embed = embed
         .footer(CreateEmbedFooter::new(format!(
-            "Preset: {} • EAC Tracker",
+            "Preset: {}",
             game.name
         )))
         .timestamp(Timestamp::now());
@@ -370,26 +374,26 @@ pub fn build_preset_insight(
     if is_tracked {
         buttons.push(
             CreateButton::new(format!("dash:btn:untrack_preset:{}", game.name))
-                .label("🗑️ Stop Tracking")
+                .label("Stop Tracking")
                 .style(ButtonStyle::Danger),
         );
     } else {
         buttons.push(
             CreateButton::new(format!("dash:btn:track_preset:{}", game.name))
-                .label("➕ Track Preset")
+                .label("Track Preset")
                 .style(ButtonStyle::Success),
         );
     }
 
     buttons.push(
         CreateButton::new(format!("dash:btn:probe_preset:{}", game.name))
-            .label("⚡ Probe CDN Now")
+            .label("Probe CDN")
             .style(ButtonStyle::Primary),
     );
 
     buttons.push(
         CreateButton::new("dash:btn:home")
-            .label("⬅️ Back to Dashboard")
+            .label("Back")
             .style(ButtonStyle::Secondary),
     );
 
@@ -412,26 +416,26 @@ pub fn build_tracked_manage(
                 seen.seen_at
             ));
         } else {
-            status_lines.push(format!("• `{platform}`: *Pending first poll sweep*"));
+            status_lines.push(format!("• `{platform}`: Pending first poll sweep"));
         }
     }
     let status_str = if status_lines.is_empty() {
-        "*No platforms configured.*".to_string()
+        "No platforms configured.".to_string()
     } else {
         status_lines.join("\n")
     };
 
     let embed = CreateEmbed::new()
-        .title(format!("🎯 Manage Tracked Game: {}", game.name))
+        .title(format!("Manage Tracked Game: {}", game.name))
         .description(format!(
-            "Manage tracking configuration or trigger an immediate check for **{}**.",
+            "Inspect current state or trigger an immediate check for **{}**.",
             game.name
         ))
-        .color(0x3498DB)
+        .color(COLOR_NEUTRAL)
         .field(
-            "🏷️ Deployment Details",
+            "Deployment Details",
             format!(
-                "• **Product ID**: `{}`\n• **Deployment ID**: `{}`\n• **Platforms**: {}",
+                "• Product ID: `{}`\n• Deployment ID: `{}`\n• Platforms: {}",
                 game.product_id,
                 game.deployment_id,
                 if game.platforms.is_empty() {
@@ -446,21 +450,21 @@ pub fn build_tracked_manage(
             ),
             false,
         )
-        .field("📡 Current Monitored State", status_str, false)
+        .field("Monitored State", status_str, false)
         .footer(CreateEmbedFooter::new(
-            "Tracked Game Management • EAC Tracker",
+            "Tracked Game Management",
         ))
         .timestamp(Timestamp::now());
 
     let buttons = vec![
         CreateButton::new(format!("dash:btn:check_game:{}", game.name))
-            .label("⚡ Check Modules Now")
+            .label("Check Now")
             .style(ButtonStyle::Primary),
         CreateButton::new(format!("dash:btn:remove_game:{}", game.name))
-            .label("🗑️ Remove Game")
+            .label("Remove Game")
             .style(ButtonStyle::Danger),
         CreateButton::new("dash:btn:home")
-            .label("⬅️ Back to Dashboard")
+            .label("Back")
             .style(ButtonStyle::Secondary),
     ];
 
@@ -484,27 +488,27 @@ pub fn build_status_view(tracker: &Tracker) -> (CreateEmbed, Vec<CreateActionRow
     };
 
     let embed = CreateEmbed::new()
-        .title("📊 EAC Tracker — System Target Status")
+        .title("EAC Tracker — System Status")
         .description(body_truncated)
-        .color(0x5865F2)
+        .color(COLOR_NEUTRAL)
         .field(
-            "ℹ️ Summary",
+            "Summary",
             format!(
-                "• **Poll Interval**: `{}s`\n• **Total Targets**: `{}`",
+                "• Poll Interval: `{}s`\n• Total Targets: `{}`",
                 tracker.poll_interval(),
                 tracker.target_count()
             ),
             false,
         )
-        .footer(CreateEmbedFooter::new("System Status • EAC Tracker"))
+        .footer(CreateEmbedFooter::new("System Status"))
         .timestamp(Timestamp::now());
 
     let buttons = vec![
         CreateButton::new("dash:btn:view_status")
-            .label("🔄 Refresh Status")
+            .label("Refresh")
             .style(ButtonStyle::Primary),
         CreateButton::new("dash:btn:home")
-            .label("⬅️ Back to Dashboard")
+            .label("Back")
             .style(ButtonStyle::Secondary),
     ];
 
@@ -563,7 +567,7 @@ mod tests {
             json["title"]
                 .as_str()
                 .unwrap()
-                .contains("Control Panel & Dashboard")
+                .contains("Configuration Dashboard")
         );
 
         let _ = std::fs::remove_dir_all(dir);
