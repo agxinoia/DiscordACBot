@@ -257,6 +257,19 @@ pub fn build_main_dashboard(
     (embed, rows)
 }
 
+/// Available platform targets on the Epic Games EAC CDN.
+pub const PLATFORM_INFO: &[(&str, &str)] = &[
+    ("win64", "Windows 64-bit (standard desktop)"),
+    ("winarm_x64_x64", "Windows ARM64 (host with x64 translation)"),
+    ("linux32_64", "Linux 32/64-bit runtime (native & Proton)"),
+    ("mac64", "macOS 64-bit Mach-O container"),
+    ("wow64_win64", "Windows WoW64 (32-on-64 hybrid)"),
+    ("win32", "Windows 32-bit legacy"),
+    ("wow64", "Windows WoW64 legacy"),
+    ("wine64", "Wine 64-bit compatibility target"),
+    ("wine32", "Wine 32-bit compatibility target"),
+];
+
 /// Build the preset insight view for a specific known game.
 pub fn build_preset_insight(
     guild_id: u64,
@@ -284,7 +297,7 @@ pub fn build_preset_insight(
                 .join(", ")
         )
     } else {
-        "Not currently tracked in this server. Click 'Track Preset' below to probe and monitor."
+        "Not currently tracked in this server. Select platforms below or click 'Track All Live'."
             .to_string()
     };
 
@@ -370,6 +383,39 @@ pub fn build_preset_insight(
         )))
         .timestamp(Timestamp::now());
 
+    let platform_options: Vec<CreateSelectMenuOption> = PLATFORM_INFO
+        .iter()
+        .map(|(plat, desc)| {
+            let is_typical = game.typical_platforms.contains(plat);
+            let currently_tracked = tracked_entry
+                .is_some_and(|g| g.platforms.iter().any(|p| p == *plat));
+            let desc_suffix = if is_typical {
+                format!("{desc} [Recommended]")
+            } else {
+                desc.to_string()
+            };
+            CreateSelectMenuOption::new(*plat, *plat)
+                .description(desc_suffix)
+                .default_selection(currently_tracked)
+        })
+        .collect();
+
+    let placeholder = if is_tracked {
+        "Update tracked platform(s)..."
+    } else {
+        "Choose platform(s) to track..."
+    };
+
+    let platform_menu = CreateSelectMenu::new(
+        format!("dash:preset_platforms:{}", game.name),
+        CreateSelectMenuKind::String {
+            options: platform_options,
+        },
+    )
+    .placeholder(placeholder)
+    .min_values(1)
+    .max_values(PLATFORM_INFO.len() as u8);
+
     let mut buttons = Vec::new();
     if is_tracked {
         buttons.push(
@@ -380,7 +426,7 @@ pub fn build_preset_insight(
     } else {
         buttons.push(
             CreateButton::new(format!("dash:btn:track_preset:{}", game.name))
-                .label("Track Preset")
+                .label("Track All Live")
                 .style(ButtonStyle::Success),
         );
     }
@@ -397,7 +443,13 @@ pub fn build_preset_insight(
             .style(ButtonStyle::Secondary),
     );
 
-    (embed, vec![CreateActionRow::Buttons(buttons)])
+    (
+        embed,
+        vec![
+            CreateActionRow::SelectMenu(platform_menu),
+            CreateActionRow::Buttons(buttons),
+        ],
+    )
 }
 
 /// Build the management view for a specific tracked game.
@@ -428,7 +480,7 @@ pub fn build_tracked_manage(
     let embed = CreateEmbed::new()
         .title(format!("Manage Tracked Game: {}", game.name))
         .description(format!(
-            "Inspect current state or trigger an immediate check for **{}**.",
+            "Inspect current state or update tracked platforms for **{}**.",
             game.name
         ))
         .color(COLOR_NEUTRAL)
@@ -456,6 +508,26 @@ pub fn build_tracked_manage(
         ))
         .timestamp(Timestamp::now());
 
+    let platform_options: Vec<CreateSelectMenuOption> = PLATFORM_INFO
+        .iter()
+        .map(|(plat, desc)| {
+            let currently_tracked = game.platforms.iter().any(|p| p == *plat);
+            CreateSelectMenuOption::new(*plat, *plat)
+                .description(*desc)
+                .default_selection(currently_tracked)
+        })
+        .collect();
+
+    let platform_menu = CreateSelectMenu::new(
+        format!("dash:game_platforms:{}", game.name),
+        CreateSelectMenuKind::String {
+            options: platform_options,
+        },
+    )
+    .placeholder("Update tracked platform(s)...")
+    .min_values(1)
+    .max_values(PLATFORM_INFO.len() as u8);
+
     let buttons = vec![
         CreateButton::new(format!("dash:btn:check_game:{}", game.name))
             .label("Check Now")
@@ -468,7 +540,13 @@ pub fn build_tracked_manage(
             .style(ButtonStyle::Secondary),
     ];
 
-    (embed, vec![CreateActionRow::Buttons(buttons)])
+    (
+        embed,
+        vec![
+            CreateActionRow::SelectMenu(platform_menu),
+            CreateActionRow::Buttons(buttons),
+        ],
+    )
 }
 
 /// Build the system status view.
@@ -609,8 +687,8 @@ mod tests {
                 .contains("Facepunch Studios")
         );
 
-        // Has 1 action row of buttons
-        assert_eq!(rows.len(), 1);
+        // Has 2 action rows: 1 select menu + 1 button row
+        assert_eq!(rows.len(), 2);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -628,7 +706,7 @@ mod tests {
 
         let json = serde_json::to_value(&embed).unwrap();
         assert!(json["title"].as_str().unwrap().contains("Rust"));
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
 
         let _ = std::fs::remove_dir_all(dir);
     }

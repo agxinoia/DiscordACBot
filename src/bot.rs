@@ -15,7 +15,8 @@ use serenity::all::{
     AutocompleteChoice, ChannelType, CommandDataOption, CommandDataOptionValue,
     CommandInteraction, CommandOptionType, ComponentInteraction, ComponentInteractionDataKind,
     Context, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu,
+    CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateSelectMenu,
     CreateSelectMenuKind, CreateSelectMenuOption, EditInteractionResponse, EventHandler, GuildId,
     Interaction, Permissions, Ready,
 };
@@ -1087,6 +1088,105 @@ impl Handler {
                                 .embed(embed)
                                 .components(components),
                         ),
+                    )
+                    .await;
+            }
+            id if id.starts_with("dash:preset_platforms:") => {
+                let name = &id["dash:preset_platforms:".len()..];
+                let Some(known) = catalog::find(name) else {
+                    return;
+                };
+                let ComponentInteractionDataKind::StringSelect { values } = &mc.data.kind else {
+                    return;
+                };
+                if values.is_empty() {
+                    return;
+                }
+                if let Err(e) = mc
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await
+                {
+                    error!(error = ?e, "failed to acknowledge interaction");
+                    return;
+                }
+                let requested = values.join(", ");
+                let outcome = self
+                    .try_add(
+                        guild_id,
+                        known.name,
+                        known.product_id,
+                        known.deployment_id,
+                        Some(&requested),
+                    )
+                    .await;
+                if let Err(err) = outcome {
+                    let _ = mc
+                        .create_followup(
+                            &ctx.http,
+                            CreateInteractionResponseFollowup::new()
+                                .content(format!("Could not track platform(s): {err}"))
+                                .ephemeral(true),
+                        )
+                        .await;
+                }
+                let (embed, components) =
+                    dashboard::build_preset_insight(guild_id, &self.tracker, known, None);
+                let _ = mc
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .embed(embed)
+                            .components(components),
+                    )
+                    .await;
+            }
+            id if id.starts_with("dash:game_platforms:") => {
+                let name = &id["dash:game_platforms:".len()..];
+                let Some(game) = self.find_game(guild_id, name) else {
+                    return;
+                };
+                let ComponentInteractionDataKind::StringSelect { values } = &mc.data.kind else {
+                    return;
+                };
+                if values.is_empty() {
+                    return;
+                }
+                if let Err(e) = mc
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await
+                {
+                    error!(error = ?e, "failed to acknowledge interaction");
+                    return;
+                }
+                let requested = values.join(", ");
+                let outcome = self
+                    .try_add(
+                        guild_id,
+                        &game.name,
+                        &game.product_id,
+                        &game.deployment_id,
+                        Some(&requested),
+                    )
+                    .await;
+                if let Err(err) = outcome {
+                    let _ = mc
+                        .create_followup(
+                            &ctx.http,
+                            CreateInteractionResponseFollowup::new()
+                                .content(format!("Could not update platform(s): {err}"))
+                                .ephemeral(true),
+                        )
+                        .await;
+                }
+                let updated = self.find_game(guild_id, name).unwrap_or(game);
+                let (embed, components) =
+                    dashboard::build_tracked_manage(guild_id, &self.tracker, &updated);
+                let _ = mc
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .embed(embed)
+                            .components(components),
                     )
                     .await;
             }
