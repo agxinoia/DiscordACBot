@@ -97,6 +97,13 @@ impl Tracker {
             .collect()
     }
 
+    /// Look up the last seen state for a specific product/deployment/platform target.
+    pub fn get_seen(&self, product_id: &str, deployment_id: &str, platform: &str) -> Option<Seen> {
+        let key = target_key(product_id, deployment_id, platform);
+        let store = self.store.lock().expect("state lock poisoned");
+        store.get(&key).cloned()
+    }
+
     /// Check which of `platforms` actually exist for an id pair, without
     /// downloading them. Returns one probe per platform, in order.
     pub async fn probe_platforms(

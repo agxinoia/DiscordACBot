@@ -8,6 +8,7 @@ pub mod archive;
 pub mod bot;
 pub mod catalog;
 pub mod config;
+pub mod dashboard;
 pub mod diff;
 pub mod discover;
 pub mod eac;

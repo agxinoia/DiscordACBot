@@ -235,6 +235,17 @@ Deployments get rotated, so entries going stale is expected. Add one to
 Note Fortnite's product id is not a hex string — ids are opaque, so anything
 that is not a path separator is accepted.
 
+### Interactive in-Discord Dashboard & Preset Insights
+
+Run `/eac dashboard` in your server to launch the interactive control panel:
+
+- **Channel Configuration**: Select the alert channel directly using Discord's channel dropdown.
+- **Tracked Games Management**: Inspect configured platforms, trigger immediate module checks, or remove games.
+- **Instant Settings Toggles**: Click buttons to toggle `announce_on_first_seen` (ON/OFF), `attach_raw_response` (ON/OFF), or cycle `poll_interval_secs` (30s, 60s, 120s, 300s, 600s).
+- **Known Game Presets & Insights**: Select any preset (Apex Legends, ARC Raiders, Fortnite, Rust) to view architectural insights, CDN endpoints, and module notes.
+- **Real-Time Live Probes**: Test candidate platforms on the live Epic Games CDN to view published module sizes and stub detection before tracking.
+- **1-Click Tracking**: Track any preset or click **🚀 Track All Presets** to auto-detect platforms and begin monitoring immediately.
+
 ### Two EAC backends
 
 This tracker follows the **EOS-based** EAC, distributed from
@@ -406,6 +417,7 @@ not. Replies are ephemeral, so configuring the bot does not clutter the channel.
 
 | Command | Description |
 | --- | --- |
+| `/eac dashboard` | Open the interactive control panel to configure the announce channel, toggle tracker settings, inspect preset insights for known games, and track/manage games with buttons and select menus. |
 | `/eac setup channel:<#channel>` | Choose where updates are posted. |
 | `/eac browse` | Pick from the built-in list of known games. |
 | `/eac add game:<name> [product_id:<id> deployment_id:<id>] [platforms:<list>]` | Track a game. Ids may be omitted for a game in the built-in list. Each platform is probed first; ones that publish nothing are rejected, not stored. Omit `platforms` to detect them automatically. |

@@ -6,17 +6,18 @@
 
 use crate::catalog;
 use crate::config::Game;
+use crate::dashboard;
 use crate::eac;
 use crate::embed;
 use crate::settings::{self, MIN_POLL_INTERVAL_SECS};
 use crate::tracker::Tracker;
 use serenity::all::{
-    AutocompleteChoice, ChannelType, CommandDataOption, CommandDataOptionValue, CommandInteraction,
-    CommandOptionType, ComponentInteraction, ComponentInteractionDataKind, Context,
-    CreateAutocompleteResponse, CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, EditInteractionResponse, EventHandler, GuildId, Interaction,
-    Permissions, Ready,
+    AutocompleteChoice, ChannelType, CommandDataOption, CommandDataOptionValue,
+    CommandInteraction, CommandOptionType, ComponentInteraction, ComponentInteractionDataKind,
+    Context, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption, EditInteractionResponse, EventHandler, GuildId,
+    Interaction, Permissions, Ready,
 };
 use serenity::async_trait;
 use serenity::builder::CreateEmbed;
@@ -134,6 +135,11 @@ impl Handler {
             .description("Easy Anti-Cheat module tracker")
             // Read-only subcommands stay open; mutating ones are checked in
             // the handler, so a server can decide who may reconfigure.
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "dashboard",
+                "Open the interactive control panel to configure the bot and explore preset insights",
+            ))
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::SubCommand,
@@ -300,7 +306,7 @@ impl Handler {
         // Reconfiguration is gated; reading is not.
         let mutating = matches!(
             sub.name.as_str(),
-            "setup" | "add" | "remove" | "set" | "browse"
+            "setup" | "add" | "remove" | "set" | "browse" | "dashboard"
         );
         if mutating && !can_manage(cmd) {
             let _ = respond(
@@ -313,6 +319,7 @@ impl Handler {
         }
 
         let result = match sub.name.as_str() {
+            "dashboard" => self.reply_dashboard(ctx, cmd, guild_id).await,
             "setup" => self.reply_setup(ctx, cmd, guild_id, options).await,
             "add" => self.reply_add(ctx, cmd, guild_id, options).await,
             "browse" => self.reply_browse(ctx, cmd, guild_id).await,
@@ -330,6 +337,25 @@ impl Handler {
         if let Err(e) = result {
             error!(error = ?e, "failed to respond to interaction");
         }
+    }
+
+    async fn reply_dashboard(
+        &self,
+        ctx: &Context,
+        cmd: &CommandInteraction,
+        guild_id: u64,
+    ) -> serenity::Result<()> {
+        let (embed, components) = dashboard::build_main_dashboard(guild_id, &self.tracker);
+        cmd.create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .embed(embed)
+                    .components(components)
+                    .ephemeral(true),
+            ),
+        )
+        .await
     }
 
     async fn reply_setup(
@@ -687,6 +713,387 @@ impl Handler {
         }
     }
 
+    /// Handle interactive component events from the in-Discord dashboard.
+    async fn handle_dashboard_interaction(&self, ctx: &Context, mc: &ComponentInteraction) {
+        let Some(guild_id) = mc.guild_id.map(|g| g.get()) else {
+            return;
+        };
+        if !permits_manage(mc.member.as_ref().and_then(|m| m.permissions)) {
+            let _ = mc
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You need the **Manage Server** permission to use the dashboard.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        let custom_id = mc.data.custom_id.as_str();
+        match custom_id {
+            "dash:preset_select" => {
+                let ComponentInteractionDataKind::StringSelect { values } = &mc.data.kind else {
+                    return;
+                };
+                let Some(name) = values.first() else {
+                    return;
+                };
+                let Some(known) = catalog::find(name) else {
+                    return;
+                };
+                let (embed, components) =
+                    dashboard::build_preset_insight(guild_id, &self.tracker, known, None);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:tracked_select" => {
+                let ComponentInteractionDataKind::StringSelect { values } = &mc.data.kind else {
+                    return;
+                };
+                let Some(name) = values.first() else {
+                    return;
+                };
+                let Some(game) = self.find_game(guild_id, name) else {
+                    return;
+                };
+                let (embed, components) =
+                    dashboard::build_tracked_manage(guild_id, &self.tracker, &game);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:channel_select" => {
+                let ComponentInteractionDataKind::ChannelSelect { values } = &mc.data.kind else {
+                    return;
+                };
+                let Some(channel_id) = values.first() else {
+                    return;
+                };
+                let _ = self
+                    .tracker
+                    .settings()
+                    .edit_guild(guild_id, |g| g.channel_id = Some(channel_id.get()));
+                let (embed, components) =
+                    dashboard::build_main_dashboard(guild_id, &self.tracker);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:btn:home" | "dash:btn:refresh" => {
+                let (embed, components) =
+                    dashboard::build_main_dashboard(guild_id, &self.tracker);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:btn:toggle_first_seen" => {
+                let config = self.tracker.config();
+                let _ = self.tracker.settings().edit_guild(guild_id, |g| {
+                    let current = g
+                        .announce_on_first_seen
+                        .unwrap_or(config.tracker.announce_on_first_seen);
+                    g.announce_on_first_seen = Some(!current);
+                });
+                let (embed, components) =
+                    dashboard::build_main_dashboard(guild_id, &self.tracker);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:btn:toggle_raw" => {
+                let config = self.tracker.config();
+                let _ = self.tracker.settings().edit_guild(guild_id, |g| {
+                    let current = g
+                        .attach_raw_response
+                        .unwrap_or(config.tracker.attach_raw_response);
+                    g.attach_raw_response = Some(!current);
+                });
+                let (embed, components) =
+                    dashboard::build_main_dashboard(guild_id, &self.tracker);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:btn:cycle_poll" => {
+                let current = self.tracker.poll_interval();
+                let next = match current {
+                    30 => 60,
+                    60 => 120,
+                    120 => 300,
+                    300 => 600,
+                    _ => 30,
+                };
+                let _ = self.tracker.settings().set_poll_interval(next);
+                let (embed, components) =
+                    dashboard::build_main_dashboard(guild_id, &self.tracker);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:btn:view_status" => {
+                let (embed, components) = dashboard::build_status_view(&self.tracker);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            "dash:btn:add_all_presets" => {
+                if let Err(e) = mc
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await
+                {
+                    error!(error = ?e, "failed to acknowledge interaction");
+                    return;
+                }
+                let tracked = self.games(guild_id);
+                let untracked = catalog::not_yet_tracked(&tracked);
+                for known in untracked {
+                    let _ = self
+                        .try_add(
+                            guild_id,
+                            known.name,
+                            known.product_id,
+                            known.deployment_id,
+                            None,
+                        )
+                        .await;
+                }
+                let (embed, components) =
+                    dashboard::build_main_dashboard(guild_id, &self.tracker);
+                let _ = mc
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .embed(embed)
+                            .components(components),
+                    )
+                    .await;
+            }
+            id if id.starts_with("dash:btn:track_preset:") => {
+                let name = &id["dash:btn:track_preset:".len()..];
+                let Some(known) = catalog::find(name) else {
+                    return;
+                };
+                if let Err(e) = mc
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await
+                {
+                    error!(error = ?e, "failed to acknowledge interaction");
+                    return;
+                }
+                let _ = self
+                    .try_add(
+                        guild_id,
+                        known.name,
+                        known.product_id,
+                        known.deployment_id,
+                        None,
+                    )
+                    .await;
+                let (embed, components) =
+                    dashboard::build_preset_insight(guild_id, &self.tracker, known, None);
+                let _ = mc
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .embed(embed)
+                            .components(components),
+                    )
+                    .await;
+            }
+            id if id.starts_with("dash:btn:untrack_preset:") => {
+                let name = &id["dash:btn:untrack_preset:".len()..];
+                let Some(game) = self.find_game(guild_id, name) else {
+                    return;
+                };
+                let seed = self.games(guild_id);
+                let _ = self.tracker.settings().edit_guild(guild_id, |g| {
+                    if g.games.is_empty() {
+                        g.games = seed;
+                    }
+                    g.games.retain(|existing| existing.name != game.name);
+                });
+                if let Some(known) = catalog::find(name) {
+                    let (embed, components) =
+                        dashboard::build_preset_insight(guild_id, &self.tracker, known, None);
+                    let _ = mc
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::UpdateMessage(
+                                CreateInteractionResponseMessage::new()
+                                    .embed(embed)
+                                    .components(components),
+                            ),
+                        )
+                        .await;
+                } else {
+                    let (embed, components) =
+                        dashboard::build_main_dashboard(guild_id, &self.tracker);
+                    let _ = mc
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::UpdateMessage(
+                                CreateInteractionResponseMessage::new()
+                                    .embed(embed)
+                                    .components(components),
+                            ),
+                        )
+                        .await;
+                }
+            }
+            id if id.starts_with("dash:btn:probe_preset:") => {
+                let name = &id["dash:btn:probe_preset:".len()..];
+                let Some(known) = catalog::find(name) else {
+                    return;
+                };
+                if let Err(e) = mc
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await
+                {
+                    error!(error = ?e, "failed to acknowledge interaction");
+                    return;
+                }
+                let candidates: Vec<String> = eac::CANDIDATE_PLATFORMS
+                    .iter()
+                    .map(|p| (*p).to_string())
+                    .collect();
+                let probes = self
+                    .tracker
+                    .probe_platforms(known.product_id, known.deployment_id, &candidates)
+                    .await;
+                let probe_pairs: Vec<(String, Result<eac::Probe, String>)> = candidates
+                    .into_iter()
+                    .zip(probes.into_iter().map(|res| res.map_err(|e| e.to_string())))
+                    .collect();
+                let (embed, components) = dashboard::build_preset_insight(
+                    guild_id,
+                    &self.tracker,
+                    known,
+                    Some(&probe_pairs),
+                );
+                let _ = mc
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .embed(embed)
+                            .components(components),
+                    )
+                    .await;
+            }
+            id if id.starts_with("dash:btn:check_game:") => {
+                let name = &id["dash:btn:check_game:".len()..];
+                let Some(game) = self.find_game(guild_id, name) else {
+                    return;
+                };
+                if let Err(e) = mc
+                    .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+                    .await
+                {
+                    error!(error = ?e, "failed to acknowledge interaction");
+                    return;
+                }
+                for platform in &game.platforms {
+                    let _ = self.tracker.check(&game, platform).await;
+                }
+                let (embed, components) =
+                    dashboard::build_tracked_manage(guild_id, &self.tracker, &game);
+                let _ = mc
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .embed(embed)
+                            .components(components),
+                    )
+                    .await;
+            }
+            id if id.starts_with("dash:btn:remove_game:") => {
+                let name = &id["dash:btn:remove_game:".len()..];
+                let Some(game) = self.find_game(guild_id, name) else {
+                    return;
+                };
+                let seed = self.games(guild_id);
+                let _ = self.tracker.settings().edit_guild(guild_id, |g| {
+                    if g.games.is_empty() {
+                        g.games = seed;
+                    }
+                    g.games.retain(|existing| existing.name != game.name);
+                });
+                let (embed, components) =
+                    dashboard::build_main_dashboard(guild_id, &self.tracker);
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .embed(embed)
+                                .components(components),
+                        ),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
     async fn reply_remove(
         &self,
         ctx: &Context,
@@ -978,6 +1385,9 @@ impl EventHandler for Handler {
             Interaction::Autocomplete(ac) if ac.data.name == "eac" => {
                 self.handle_autocomplete(&ctx, &ac).await;
             }
+            Interaction::Component(mc) if mc.data.custom_id.starts_with("dash:") => {
+                self.handle_dashboard_interaction(&ctx, &mc).await;
+            }
             Interaction::Component(mc) if mc.data.custom_id == SELECT_KNOWN => {
                 self.handle_selection(&ctx, &mc).await;
             }
@@ -1151,14 +1561,14 @@ mod tests {
             .map(|o| o["name"].as_str().unwrap())
             .collect();
         for expected in [
-            "setup", "add", "browse", "remove", "list", "config", "status", "check", "set",
+            "dashboard", "setup", "add", "browse", "remove", "list", "config", "status", "check", "set",
         ] {
             assert!(names.contains(&expected), "missing /eac {expected}");
         }
 
         // Every subcommand routed by handle_command must exist on the command,
         // and every subcommand on the command must be routed.
-        assert_eq!(names.len(), 9, "a subcommand was added without a route");
+        assert_eq!(names.len(), 10, "a subcommand was added without a route");
     }
 
     #[test]

@@ -15,6 +15,9 @@ pub struct KnownGame {
     pub name: &'static str,
     pub product_id: &'static str,
     pub deployment_id: &'static str,
+    pub publisher: &'static str,
+    pub typical_platforms: &'static [&'static str],
+    pub insight: &'static str,
 }
 
 /// Known deployments, alphabetical. Discord select menus hold 25 options, so
@@ -24,21 +27,33 @@ pub const KNOWN: &[KnownGame] = &[
         name: "Apex Legends",
         product_id: "5dcd88f4e2094a698ebffa43438edc33",
         deployment_id: "47a5a1b2e0f64748a96777920ad97fbd",
+        publisher: "Respawn Entertainment / EA",
+        typical_platforms: &["win64", "winarm_x64_x64", "linux32_64"],
+        insight: "Uses modern EOS EAC container with embedded PE modules (x64, arm64, linux). Linux runtime enabled for Steam Deck/Proton compatibility.",
     },
     KnownGame {
         name: "ARC Raiders",
         product_id: "9e8b37541e614575b4de303d2c2e44cf",
         deployment_id: "35e06571d8ab4de4b98519b624125459",
+        publisher: "Embark Studios",
+        typical_platforms: &["win64", "wow64_win64", "winarm_x64_x64", "linux32_64"],
+        insight: "Carries driver.sys, usermode.exe, client.dll (~22 MB). Note: legacy 13.8 KB stub endpoints exist and are automatically filtered out during auto-detection.",
     },
     KnownGame {
         name: "Fortnite",
         product_id: "prod-fn",
         deployment_id: "62a9473a2dca46b29ccf17577fcf42d7",
+        publisher: "Epic Games",
+        typical_platforms: &["win64", "winarm_x64_x64", "mac64"],
+        insight: "Epic's flagship deployment with non-hex product ID 'prod-fn'. Publishes macOS EAC modules alongside Windows and ARM64.",
     },
     KnownGame {
         name: "Rust",
         product_id: "429c2212ad284866aee071454c2125b5",
         deployment_id: "76796531e86443548754600511f42e9e",
+        publisher: "Facepunch Studios",
+        typical_platforms: &["win64", "winarm_x64_x64", "mac64"],
+        insight: "High-frequency module updates (~32 MB PE containers) with Authenticode code-signing certs. Actively supports Windows and macOS platforms.",
     },
 ];
 
@@ -52,6 +67,21 @@ impl KnownGame {
             deployment_id: self.deployment_id.to_string(),
             platforms: Vec::new(),
         }
+    }
+
+    /// CDN URL for a given platform.
+    pub fn cdn_url(&self, platform: &str) -> String {
+        format!(
+            "https://modules-cdn.eac-prod.on.epicgames.com/modules/{}/{}/{}",
+            self.product_id, self.deployment_id, platform
+        )
+    }
+
+    /// Whether this known game's product & deployment IDs are tracked.
+    pub fn is_tracked(&self, tracked: &[Game]) -> bool {
+        tracked.iter().any(|g| {
+            g.product_id == self.product_id && g.deployment_id == self.deployment_id
+        })
     }
 }
 
@@ -138,5 +168,24 @@ mod tests {
     fn a_catalogue_entry_carries_no_platforms() {
         // Platforms come from probing; baking in a guess is what broke before.
         assert!(find("Rust").unwrap().to_game().platforms.is_empty());
+    }
+
+    #[test]
+    fn cdn_url_formats_expected_path() {
+        let rust = find("Rust").unwrap();
+        assert_eq!(
+            rust.cdn_url("win64"),
+            "https://modules-cdn.eac-prod.on.epicgames.com/modules/429c2212ad284866aee071454c2125b5/76796531e86443548754600511f42e9e/win64"
+        );
+    }
+
+    #[test]
+    fn is_tracked_matches_deployments() {
+        let rust = find("Rust").unwrap();
+        let tracked = vec![rust.to_game()];
+        assert!(rust.is_tracked(&tracked));
+
+        let apex = find("Apex Legends").unwrap();
+        assert!(!apex.is_tracked(&tracked));
     }
 }
