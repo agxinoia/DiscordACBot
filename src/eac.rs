@@ -1,0 +1,700 @@
+//! Easy Anti-Cheat module CDN client.
+//!
+//! EAC modules are distributed from an Epic Games endpoint addressed by the
+//! game's product id, deployment id and platform:
+//!
+//! ```text
+//! https://modules-cdn.eac-prod.on.epicgames.com/modules/{product_id}/{deployment_id}/{platform}
+//! ```
+//!
+//! ## On parsing
+//!
+//! The response is a binary container, not a bare image: the modules sit at
+//! offsets inside it, and one response carries several architectures at once,
+//! which is why a platform segment is a composite such as `wow64_win64`.
+//!
+//! The format is not documented and Epic has changed it before, so nothing
+//! here *depends* on it. Change detection is driven purely by the SHA-256 of
+//! the raw response body, which is correct for any format. [`parse_modules`]
+//! is a best-effort enrichment pass on top: a JSON manifest first, then PE
+//! images carved out of the container, then a plain scan for embedded
+//! filenames. When all three come up empty the update still reports
+//! correctly, just without the per-module breakdown.
+
+use crate::analysis::{self, Hashes, PeInfo};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+pub const CDN_BASE: &str = "https://modules-cdn.eac-prod.on.epicgames.com/modules";
+
+/// Build the module URL for a target. A trailing slash on `base` is tolerated
+/// so a hand-written config override cannot produce a `//` path.
+pub fn module_url_with_base(
+    base: &str,
+    product_id: &str,
+    deployment_id: &str,
+    platform: &str,
+) -> String {
+    let base = base.trim_end_matches('/');
+    format!("{base}/{product_id}/{deployment_id}/{platform}")
+}
+
+/// One module named inside a CDN response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleEntry {
+    pub name: String,
+    pub arch: Option<String>,
+    pub size: Option<u64>,
+    pub hash: Option<String>,
+}
+
+/// A single fetch of one target.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub url: String,
+    pub body: Vec<u8>,
+    /// MD5, SHA-1 and SHA-256, full length. SHA-256 is the change-detection
+    /// signal; the others exist to cross-reference external sample databases.
+    pub hashes: Hashes,
+    /// Every response header, lowercased. Retained in full because CDN headers
+    /// are cheap to capture now and impossible to reconstruct later.
+    pub headers: BTreeMap<String, String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub modules: Vec<ModuleEntry>,
+    /// Container format guessed from magic bytes.
+    pub format: String,
+    pub entropy: f64,
+    pub tlsh: Option<String>,
+    /// Header detail for the payload's primary PE image, whether the payload
+    /// is a bare PE or a container with one embedded at an offset.
+    pub pe: Option<PeInfo>,
+}
+
+impl Snapshot {
+    pub fn size(&self) -> u64 {
+        self.body.len() as u64
+    }
+
+    /// Full SHA-256, lowercase hex.
+    pub fn digest(&self) -> &str {
+        &self.hashes.sha256
+    }
+
+    /// First 16 hex chars of the digest — what the embed displays.
+    pub fn short_digest(&self) -> &str {
+        short_hash(self.digest())
+    }
+
+    /// Build a snapshot straight from bytes, as though they had been fetched.
+    /// Used by tests in other modules and by nothing else.
+    #[doc(hidden)]
+    pub fn for_test(body: &[u8]) -> Self {
+        Self {
+            hashes: analysis::hashes(body),
+            modules: parse_modules(body),
+            format: analysis::detect_format(body).to_string(),
+            entropy: analysis::shannon_entropy(body),
+            tlsh: analysis::tlsh(body),
+            pe: analysis::analyse_primary_pe(body),
+            url: String::new(),
+            body: body.to_vec(),
+            headers: BTreeMap::new(),
+            etag: None,
+            last_modified: None,
+        }
+    }
+}
+
+/// Truncate a hex hash for display, matching the compact form used in embeds.
+pub fn short_hash(hash: &str) -> &str {
+    let end = hash.char_indices().nth(16).map_or(hash.len(), |(i, _)| i);
+    &hash[..end]
+}
+
+/// Result of a cheap existence check for one target.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub url: String,
+    pub platform: String,
+    pub status: u16,
+    pub content_length: Option<u64>,
+}
+
+/// Smallest response plausibly containing a real module.
+///
+/// Measured modules run from 8.2 MB to 32.8 MB. Well under that is a stub or
+/// an error document: one deployment answers for three legacy platform names
+/// with an identical 13.8 KB body, which is not a module however much it looks
+/// like a success.
+pub const MIN_PLAUSIBLE_MODULE_BYTES: u64 = 1024 * 1024;
+
+impl Probe {
+    /// A 2xx status. Necessary but not sufficient — see [`Probe::is_module`].
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// Whether this target is worth tracking.
+    ///
+    /// An empty body is never a module: the CDN answers 200 with
+    /// `Content-Length: 0` for platforms a deployment does not publish, and
+    /// tracking one would watch a target that can never meaningfully change.
+    pub fn is_module(&self) -> bool {
+        self.ok() && self.content_length != Some(0)
+    }
+
+    /// Non-empty, but far too small to be a real module. Tracked if asked for,
+    /// since a small legacy module is conceivable, but worth saying out loud.
+    pub fn suspicious(&self) -> bool {
+        self.is_module()
+            && self
+                .content_length
+                .is_some_and(|n| n < MIN_PLAUSIBLE_MODULE_BYTES)
+    }
+}
+
+/// The default platform for a Windows x64 deployment.
+///
+/// Measured against the live CDN: every deployment checked so far publishes
+/// `win64`, which also matches the URL this project started from.
+pub const DEFAULT_PLATFORM: &str = "win64";
+
+/// Platform strings worth trying when the right one is unknown, ordered by how
+/// often they were observed to answer.
+///
+/// A deployment publishes only some of these, and which ones varies a lot —
+/// one game answered for seven of the nine, another for three — so probing is
+/// the only way to know. Both bare OS types and composite forms are real: the
+/// composites name a *combination* of targets, because one response bundles
+/// several architectures.
+pub const CANDIDATE_PLATFORMS: &[&str] = &[
+    "win64",
+    "winarm_x64_x64",
+    "mac64",
+    "linux32_64",
+    "wow64_win64",
+    "win32",
+    "wow64",
+    "wine64",
+    "wine32",
+];
+
+pub struct Client {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl Client {
+    /// Build a client against a non-default base, for mirrors and tests.
+    pub fn with_base(base: &str, user_agent: &str, timeout: Duration) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent(user_agent)
+            .timeout(timeout)
+            .build()
+            .context("building HTTP client")?;
+        Ok(Self {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// Check whether a target exists, without downloading it.
+    ///
+    /// Uses HEAD, falling back to a single-byte ranged GET for servers that
+    /// reject it. A non-2xx status is returned rather than raised: "this id
+    /// pair is wrong" is an answer, not a failure.
+    pub async fn probe(
+        &self,
+        product_id: &str,
+        deployment_id: &str,
+        platform: &str,
+    ) -> Result<Probe> {
+        let url = module_url_with_base(&self.base, product_id, deployment_id, platform);
+
+        let mut resp = self
+            .http
+            .head(&url)
+            .send()
+            .await
+            .with_context(|| format!("probing {url}"))?;
+
+        if matches!(resp.status().as_u16(), 405 | 501) {
+            resp = self
+                .http
+                .get(&url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()
+                .await
+                .with_context(|| format!("probing {url}"))?;
+        }
+
+        let status = resp.status().as_u16();
+        // On a HEAD there is no body, so `content_length()` reports 0 rather
+        // than the advertised size; read the header itself. On a 206 the
+        // Content-Length is the one byte requested, and the full size lives
+        // in the Content-Range total.
+        let header_value = |name: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let ranged_total = header_value(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.rsplit('/').next().and_then(|t| t.parse::<u64>().ok()));
+        let advertised =
+            header_value(reqwest::header::CONTENT_LENGTH).and_then(|v| v.parse::<u64>().ok());
+
+        Ok(Probe {
+            content_length: if status == 206 {
+                ranged_total.or(advertised)
+            } else {
+                advertised.or(ranged_total)
+            },
+            status,
+            url,
+            platform: platform.to_string(),
+        })
+    }
+
+    /// Fetch one target and digest it.
+    pub async fn fetch(
+        &self,
+        product_id: &str,
+        deployment_id: &str,
+        platform: &str,
+    ) -> Result<Snapshot> {
+        let url = module_url_with_base(&self.base, product_id, deployment_id, platform);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting {url}"))?;
+
+        let status = resp.status();
+        // Headers must be taken before the body, which consumes the response.
+        let headers: BTreeMap<String, String> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let etag = headers.get("etag").cloned();
+        let last_modified = headers.get("last-modified").cloned();
+
+        let body = resp
+            .bytes()
+            .await
+            .with_context(|| format!("reading body of {url}"))?
+            .to_vec();
+
+        if !status.is_success() {
+            anyhow::bail!("{url} returned HTTP {status}");
+        }
+
+        Ok(Snapshot {
+            hashes: analysis::hashes(&body),
+            modules: parse_modules(&body),
+            format: analysis::detect_format(&body).to_string(),
+            entropy: analysis::shannon_entropy(&body),
+            tlsh: analysis::tlsh(&body),
+            pe: analysis::analyse_primary_pe(&body),
+            url,
+            body,
+            headers,
+            etag,
+            last_modified,
+        })
+    }
+}
+
+/// Best-effort extraction of module entries from a CDN response body.
+///
+/// Tried in order of how much each yields: a JSON manifest, then PE images
+/// carved out of a binary container — which is what the CDN actually serves —
+/// then a plain scan for embedded filenames.
+pub fn parse_modules(body: &[u8]) -> Vec<ModuleEntry> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        let mut found = Vec::new();
+        collect_json_modules(&value, None, &mut found);
+        if !found.is_empty() {
+            dedupe(&mut found);
+            return found;
+        }
+    }
+
+    let carved = analysis::carve_pe_modules(body);
+    if !carved.is_empty() {
+        return carved
+            .iter()
+            .enumerate()
+            .map(|(i, module)| ModuleEntry {
+                name: module
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("module{i}@0x{:x}", module.offset)),
+                arch: Some(module.machine.clone()),
+                size: Some(module.size as u64),
+                hash: Some(module.sha256.clone()),
+            })
+            .collect();
+    }
+
+    scan_for_filenames(body)
+}
+
+const NAME_KEYS: &[&str] = &["name", "file", "filename", "module", "path", "moduleName"];
+const SIZE_KEYS: &[&str] = &[
+    "size",
+    "length",
+    "bytes",
+    "fileSize",
+    "sizeBytes",
+    "contentLength",
+];
+const HASH_KEYS: &[&str] = &["hash", "sha256", "sha1", "checksum", "digest", "md5"];
+const ARCH_KEYS: &[&str] = &["arch", "architecture", "cpu", "platform", "target"];
+
+/// Walk arbitrary JSON collecting anything that looks like a module record.
+///
+/// `key_hint` carries the object's own key from the parent, so a payload shaped
+/// as `{"driver.sys": {"size": 123}}` is recognised as well as the more usual
+/// `[{"name": "driver.sys", "size": 123}]`.
+fn collect_json_modules(value: &Value, key_hint: Option<&str>, out: &mut Vec<ModuleEntry>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_json_modules(item, None, out);
+            }
+        }
+        Value::Object(map) => {
+            let name = NAME_KEYS
+                .iter()
+                .find_map(|k| map.get(*k).and_then(Value::as_str))
+                .map(str::to_owned)
+                .or_else(|| key_hint.filter(|h| looks_like_module(h)).map(str::to_owned));
+
+            let size = SIZE_KEYS.iter().find_map(|k| map.get(*k).and_then(as_u64));
+            let hash = HASH_KEYS
+                .iter()
+                .find_map(|k| map.get(*k).and_then(Value::as_str))
+                .map(str::to_owned);
+
+            // A record needs a name plus at least one corroborating field,
+            // otherwise every nested object with a "name" gets swept up.
+            if let Some(name) = name
+                && (size.is_some() || hash.is_some())
+            {
+                out.push(ModuleEntry {
+                    arch: ARCH_KEYS
+                        .iter()
+                        .find_map(|k| map.get(*k).and_then(Value::as_str))
+                        .map(str::to_owned),
+                    name,
+                    size,
+                    hash,
+                });
+            }
+
+            for (k, v) in map {
+                collect_json_modules(v, Some(k.as_str()), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// JSON numbers are sometimes serialised as strings; accept both.
+fn as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+const MODULE_EXTENSIONS: &[&str] = &[".sys", ".dll", ".exe", ".so", ".dylib"];
+
+/// Check whether a candidate token looks like a legitimate module filename.
+/// Rejects 2-byte noise (like "XW.So"), mixed-case extensions from random bytes,
+/// non-filename punctuation, and tokens without alphabetic stems.
+pub fn is_plausible_module_filename(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let Some(ext) = MODULE_EXTENSIONS.iter().find(|&&ext| lower.ends_with(ext)) else {
+        return false;
+    };
+
+    // The extension must be consistent in casing (either all-lowercase or all-uppercase),
+    // rejecting random casing like ".So" or ".sO" from arbitrary binary bytes.
+    let ext_len = ext.len();
+    let actual_ext = &token[token.len() - ext_len..];
+    let is_all_lower = actual_ext.chars().all(|c| c.is_ascii_lowercase() || c == '.');
+    let is_all_upper = actual_ext.chars().all(|c| c.is_ascii_uppercase() || c == '.');
+    if !is_all_lower && !is_all_upper {
+        return false;
+    }
+
+    let stem = &token[..token.len() - ext_len];
+
+    // Stem must be between 3 and 64 characters long (e.g. "eac.so", "client.dll"),
+    // rejecting 2-byte random noise like "XW.So" or "6A.So".
+    if stem.len() < 3 || stem.len() > 64 {
+        return false;
+    }
+
+    // Stem must consist only of valid filename characters: alphanumeric, underscore, hyphen, or dot.
+    // Characters like "'", "&", "!", "{", "+", "~" indicate binary garbage.
+    if !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        return false;
+    }
+
+    // Stem must start and end with an alphanumeric character.
+    let first = match stem.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    let last = match stem.chars().next_back() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+        return false;
+    }
+
+    // Stem must contain at least one ASCII letter.
+    if !stem.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+
+    true
+}
+
+fn looks_like_module(name: &str) -> bool {
+    is_plausible_module_filename(name)
+}
+
+/// Fallback for non-JSON payloads: pull printable ASCII runs that look like
+/// module filenames out of the blob.
+fn scan_for_filenames(body: &[u8]) -> Vec<ModuleEntry> {
+    // A high-entropy payload is compressed or encrypted (e.g. modern EAC containers
+    // with entropy ~8.0). Scanning raw ciphertext bytes for ASCII strings is guaranteed
+    // to produce random spurious matches (like "XW.So", "6A.So", "{!w.sO").
+    if analysis::shannon_entropy(body) >= 7.2 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut run = String::new();
+
+    let flush = |run: &mut String, out: &mut Vec<ModuleEntry>| {
+        for token in run.split(['\\', '/']) {
+            if is_plausible_module_filename(token) {
+                out.push(ModuleEntry {
+                    name: token.to_owned(),
+                    arch: None,
+                    size: None,
+                    hash: None,
+                });
+            }
+        }
+        run.clear();
+    };
+
+    for &byte in body {
+        // Printable ASCII, plus the path separators we split on above.
+        if byte.is_ascii_graphic() {
+            run.push(byte as char);
+            if run.len() > 512 {
+                flush(&mut run, &mut out);
+            }
+        } else {
+            flush(&mut run, &mut out);
+        }
+    }
+    flush(&mut run, &mut out);
+
+    dedupe(&mut out);
+    out
+}
+
+/// Drop repeats by name, keeping the first (richest) occurrence.
+fn dedupe(entries: &mut Vec<ModuleEntry>) {
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|e| seen.insert(e.name.to_ascii_lowercase()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_the_documented_url() {
+        assert_eq!(
+            module_url_with_base(
+                CDN_BASE,
+                "9e8b37541e614575b4de303d2c2e44cf",
+                "35e06571d8ab4de4b98519b624125459",
+                "win64"
+            ),
+            "https://modules-cdn.eac-prod.on.epicgames.com/modules/\
+             9e8b37541e614575b4de303d2c2e44cf/35e06571d8ab4de4b98519b624125459/win64"
+        );
+    }
+
+    #[test]
+    fn tolerates_a_trailing_slash_on_the_base() {
+        assert_eq!(
+            module_url_with_base("https://mirror.example/modules/", "p", "d", "win64"),
+            "https://mirror.example/modules/p/d/win64"
+        );
+    }
+
+    #[test]
+    fn short_hash_truncates_to_sixteen() {
+        assert_eq!(short_hash("d6b8cbf936b39c5200000000"), "d6b8cbf936b39c52");
+        assert_eq!(short_hash("abc"), "abc");
+    }
+
+    #[test]
+    fn parses_an_array_of_records() {
+        let body = br#"{"modules":[
+            {"name":"driver.sys","arch":"arm64","size":17301504,"hash":"bc1f4446a7008207"},
+            {"name":"client.dll","arch":"x64","size":20971520,"hash":"272d0e577de143a0"}
+        ]}"#;
+        let modules = parse_modules(body);
+        assert_eq!(modules.len(), 2);
+        assert_eq!(modules[0].name, "driver.sys");
+        assert_eq!(modules[0].arch.as_deref(), Some("arm64"));
+        assert_eq!(modules[0].size, Some(17301504));
+        assert_eq!(modules[1].hash.as_deref(), Some("272d0e577de143a0"));
+    }
+
+    #[test]
+    fn parses_a_filename_keyed_map() {
+        let body = br#"{"usermode.exe":{"size":"1048576","sha256":"b289b022c438cbf6"}}"#;
+        let modules = parse_modules(body);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "usermode.exe");
+        assert_eq!(modules[0].size, Some(1048576));
+    }
+
+    #[test]
+    fn ignores_objects_that_only_have_a_name() {
+        let body = br#"{"deployment":{"name":"prod"},"unrelated":{"name":"whatever"}}"#;
+        assert!(parse_modules(body).is_empty());
+    }
+
+    #[test]
+    fn falls_back_to_scanning_binary_blobs() {
+        let mut body = vec![0x00, 0xFF, 0x13];
+        body.extend_from_slice(b"C:\\eac\\driver.sys");
+        body.push(0x00);
+        body.extend_from_slice(b"client.dll");
+        body.extend_from_slice(&[0x00, 0x01]);
+        body.extend_from_slice(b"client.dll"); // duplicate
+        let modules = parse_modules(&body);
+        let names: Vec<_> = modules.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["driver.sys", "client.dll"]);
+    }
+
+    #[test]
+    fn scanning_skips_short_and_non_module_tokens() {
+        let modules = parse_modules(b"a.so readme.txt notes");
+        assert!(modules.is_empty(), "got {modules:?}");
+    }
+
+    #[test]
+    fn scanning_rejects_ciphertext_artifacts_and_short_stems() {
+        // High-entropy blobs (compressed/encrypted containers) return empty list
+        let random_high_entropy: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        assert!(parse_modules(&random_high_entropy).is_empty());
+
+        // Low-entropy blob with spurious tokens like "XW.So", "6A.So", "{!w.sO", "'&E.So"
+        let mut spurious = vec![0u8; 100];
+        spurious.extend_from_slice(b" XW.So 6A.So {!w.sO '&E.So 6+.sO ");
+        spurious.extend_from_slice(b" valid_module.dll ");
+        let modules = parse_modules(&spurious);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "valid_module.dll");
+    }
+
+    #[test]
+    fn plausible_filename_checks() {
+        assert!(is_plausible_module_filename("driver.sys"));
+        assert!(is_plausible_module_filename("client.dll"));
+        assert!(is_plausible_module_filename("easyanticheat_x64.so"));
+        assert!(is_plausible_module_filename("cerberus.so"));
+        assert!(is_plausible_module_filename("CLIENT.DLL"));
+
+        // False positives from binary byte noise
+        assert!(!is_plausible_module_filename("XW.So"));
+        assert!(!is_plausible_module_filename("xw.so")); // stem < 3
+        assert!(!is_plausible_module_filename("6A.So"));
+        assert!(!is_plausible_module_filename("6+.sO"));
+        assert!(!is_plausible_module_filename("{!w.sO"));
+        assert!(!is_plausible_module_filename("'&E.So"));
+        assert!(!is_plausible_module_filename("a.so"));
+        assert!(!is_plausible_module_filename("readme.txt"));
+    }
+
+    fn probe(status: u16, content_length: Option<u64>) -> Probe {
+        Probe {
+            url: String::new(),
+            platform: "win64".into(),
+            status,
+            content_length,
+        }
+    }
+
+    #[test]
+    fn an_empty_body_is_not_a_module() {
+        // The CDN answers 200 with Content-Length: 0 for platforms a
+        // deployment does not publish.
+        let empty = probe(200, Some(0));
+        assert!(empty.ok(), "it really is a 2xx");
+        assert!(!empty.is_module(), "but there is nothing there to track");
+        assert!(!empty.suspicious());
+    }
+
+    #[test]
+    fn real_module_sizes_are_accepted() {
+        // Sizes measured against the live CDN.
+        for bytes in [8_598_323u64, 10_695_475, 21_915_238, 32_820_838] {
+            let p = probe(200, Some(bytes));
+            assert!(p.is_module(), "{bytes} is a real module");
+            assert!(!p.suspicious(), "{bytes} is not suspicious");
+        }
+    }
+
+    #[test]
+    fn a_stub_is_tracked_but_flagged() {
+        // One deployment answers for three legacy platform names with an
+        // identical 13.8 KB body — a stub, not a module.
+        let stub = probe(200, Some(14_131));
+        assert!(stub.is_module(), "not empty, so not rejected outright");
+        assert!(stub.suspicious(), "but far below any real module");
+    }
+
+    #[test]
+    fn a_missing_target_is_neither() {
+        let missing = probe(404, None);
+        assert!(!missing.ok());
+        assert!(!missing.is_module());
+        assert!(!missing.suspicious());
+    }
+
+    #[test]
+    fn an_unreported_size_is_given_the_benefit_of_the_doubt() {
+        // Not every server sends Content-Length; refusing on that basis would
+        // reject targets that are fine.
+        let unknown = probe(200, None);
+        assert!(unknown.is_module());
+        assert!(!unknown.suspicious());
+    }
+}

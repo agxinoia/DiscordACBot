@@ -1,0 +1,51 @@
+# This file is OPTIONAL. The bot needs only the DISCORD_TOKEN environment
+# variable; the announce channel and tracked games are configured from Discord
+# with /eac. Use this file only to change operator-level defaults.
+
+[discord]
+# Prefer the DISCORD_TOKEN environment variable over putting the token here.
+# token = "..."
+#
+# Register /eac to one guild for instant availability instead of globally,
+# which can take up to an hour to propagate. Also settable as DISCORD_GUILD_ID.
+# guild_id = 123456789012345678
+#
+# Fallback announce channel for guilds that have not run /eac setup.
+# Normally unnecessary — set it in Discord instead.
+# channel_id = 123456789012345678
+
+[tracker]
+# Default sweep interval. Changeable at runtime with /eac set poll_interval_secs.
+poll_interval_secs = 300
+request_timeout_secs = 30
+# Per-guild defaults, overridable with /eac set.
+announce_on_first_seen = false
+attach_raw_response = false
+max_attachment_bytes = 9500000
+# Where the bot keeps its own files, relative to the working directory.
+state_path = "state.json"
+settings_path = "settings.json"
+# Every distinct payload is kept under its SHA-256, with an append-only
+# index.jsonl describing each fetch. Set to "" to disable, which also disables
+# TLSH distance in update embeds, since measuring how far a build moved needs
+# the previous payload's bytes.
+archive_path = "archive"
+# thumbnail_url = "https://example.invalid/eac-logo.png"
+
+# Games listed here act as a fallback for guilds that have not added any with
+# /eac add. The normal path is to add them in Discord.
+# [[games]]
+# name = "ARC Raiders"
+# product_id = "9e8b37541e614575b4de303d2c2e44cf"
+# deployment_id = "35e06571d8ab4de4b98519b624125459"
+# platforms = ["win64"]
+
+[ai]
+# NVIDIA NIM API key for automated binary diff analysis & reverse-engineering assistance.
+# Can also be set via NVIDIA_API_KEY environment variable or configured directly in Discord via /eac.
+# nvidia_api_key = "nvapi-..."
+# model = "z-ai/glm-5-3-flash"
+# delay_ms = 1000
+# Optional path to Ghidra analyzeHeadless script. Defaults to auto-detection.
+# ghidra_path = "/opt/ghidra/support/analyzeHeadless"
+# enabled = true
