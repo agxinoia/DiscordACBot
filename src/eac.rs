@@ -419,22 +419,82 @@ fn as_u64(value: &Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
-const MODULE_EXTENSIONS: &[&str] = &[".sys", ".dll", ".exe", ".so", ".dylib", ".bin"];
+const MODULE_EXTENSIONS: &[&str] = &[".sys", ".dll", ".exe", ".so", ".dylib"];
+
+/// Check whether a candidate token looks like a legitimate module filename.
+/// Rejects 2-byte noise (like "XW.So"), mixed-case extensions from random bytes,
+/// non-filename punctuation, and tokens without alphabetic stems.
+pub fn is_plausible_module_filename(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let Some(ext) = MODULE_EXTENSIONS.iter().find(|&&ext| lower.ends_with(ext)) else {
+        return false;
+    };
+
+    // The extension must be consistent in casing (either all-lowercase or all-uppercase),
+    // rejecting random casing like ".So" or ".sO" from arbitrary binary bytes.
+    let ext_len = ext.len();
+    let actual_ext = &token[token.len() - ext_len..];
+    let is_all_lower = actual_ext.chars().all(|c| c.is_ascii_lowercase() || c == '.');
+    let is_all_upper = actual_ext.chars().all(|c| c.is_ascii_uppercase() || c == '.');
+    if !is_all_lower && !is_all_upper {
+        return false;
+    }
+
+    let stem = &token[..token.len() - ext_len];
+
+    // Stem must be between 3 and 64 characters long (e.g. "eac.so", "client.dll"),
+    // rejecting 2-byte random noise like "XW.So" or "6A.So".
+    if stem.len() < 3 || stem.len() > 64 {
+        return false;
+    }
+
+    // Stem must consist only of valid filename characters: alphanumeric, underscore, hyphen, or dot.
+    // Characters like "'", "&", "!", "{", "+", "~" indicate binary garbage.
+    if !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        return false;
+    }
+
+    // Stem must start and end with an alphanumeric character.
+    let first = match stem.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    let last = match stem.chars().next_back() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+        return false;
+    }
+
+    // Stem must contain at least one ASCII letter.
+    if !stem.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+
+    true
+}
 
 fn looks_like_module(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    MODULE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+    is_plausible_module_filename(name)
 }
 
 /// Fallback for non-JSON payloads: pull printable ASCII runs that look like
 /// module filenames out of the blob.
 fn scan_for_filenames(body: &[u8]) -> Vec<ModuleEntry> {
+    // A high-entropy payload is compressed or encrypted (e.g. modern EAC containers
+    // with entropy ~8.0). Scanning raw ciphertext bytes for ASCII strings is guaranteed
+    // to produce random spurious matches (like "XW.So", "6A.So", "{!w.sO").
+    if analysis::shannon_entropy(body) >= 7.2 {
+        return Vec::new();
+    }
+
     let mut out = Vec::new();
     let mut run = String::new();
 
     let flush = |run: &mut String, out: &mut Vec<ModuleEntry>| {
         for token in run.split(['\\', '/']) {
-            if token.len() >= 5 && looks_like_module(token) {
+            if is_plausible_module_filename(token) {
                 out.push(ModuleEntry {
                     name: token.to_owned(),
                     arch: None,
@@ -547,6 +607,40 @@ mod tests {
     fn scanning_skips_short_and_non_module_tokens() {
         let modules = parse_modules(b"a.so readme.txt notes");
         assert!(modules.is_empty(), "got {modules:?}");
+    }
+
+    #[test]
+    fn scanning_rejects_ciphertext_artifacts_and_short_stems() {
+        // High-entropy blobs (compressed/encrypted containers) return empty list
+        let random_high_entropy: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        assert!(parse_modules(&random_high_entropy).is_empty());
+
+        // Low-entropy blob with spurious tokens like "XW.So", "6A.So", "{!w.sO", "'&E.So"
+        let mut spurious = vec![0u8; 100];
+        spurious.extend_from_slice(b" XW.So 6A.So {!w.sO '&E.So 6+.sO ");
+        spurious.extend_from_slice(b" valid_module.dll ");
+        let modules = parse_modules(&spurious);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "valid_module.dll");
+    }
+
+    #[test]
+    fn plausible_filename_checks() {
+        assert!(is_plausible_module_filename("driver.sys"));
+        assert!(is_plausible_module_filename("client.dll"));
+        assert!(is_plausible_module_filename("easyanticheat_x64.so"));
+        assert!(is_plausible_module_filename("cerberus.so"));
+        assert!(is_plausible_module_filename("CLIENT.DLL"));
+
+        // False positives from binary byte noise
+        assert!(!is_plausible_module_filename("XW.So"));
+        assert!(!is_plausible_module_filename("xw.so")); // stem < 3
+        assert!(!is_plausible_module_filename("6A.So"));
+        assert!(!is_plausible_module_filename("6+.sO"));
+        assert!(!is_plausible_module_filename("{!w.sO"));
+        assert!(!is_plausible_module_filename("'&E.So"));
+        assert!(!is_plausible_module_filename("a.so"));
+        assert!(!is_plausible_module_filename("readme.txt"));
     }
 
     fn probe(status: u16, content_length: Option<u64>) -> Probe {

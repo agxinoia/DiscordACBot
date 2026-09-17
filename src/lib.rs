@@ -3,6 +3,7 @@
 //! Exposed as a library so the fetch/parse/render layers can be tested
 //! independently of the Discord gateway.
 
+pub mod ai;
 pub mod analysis;
 pub mod archive;
 pub mod bot;
@@ -13,6 +14,8 @@ pub mod diff;
 pub mod discover;
 pub mod eac;
 pub mod embed;
+pub mod ghidra;
 pub mod settings;
 pub mod state;
 pub mod tracker;
+pub mod devirtualize;

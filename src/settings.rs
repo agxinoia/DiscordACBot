@@ -27,6 +27,14 @@ pub struct GuildSettings {
     pub announce_on_first_seen: Option<bool>,
     #[serde(default)]
     pub attach_raw_response: Option<bool>,
+    #[serde(default)]
+    pub nvidia_api_key: Option<String>,
+    #[serde(default)]
+    pub ai_model: Option<String>,
+    #[serde(default)]
+    pub ai_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub ai_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -153,6 +161,36 @@ pub fn guild_games<'a>(guild: &'a GuildSettings, config: &'a Config) -> &'a [Gam
     } else {
         &guild.games
     }
+}
+
+/// Effective NVIDIA API key, falling back to operator config / env.
+pub fn effective_nvidia_key<'a>(guild: &'a GuildSettings, config: &'a Config) -> Option<&'a str> {
+    guild
+        .nvidia_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(config.ai.nvidia_api_key.as_deref())
+}
+
+/// Effective AI model name, falling back to operator config.
+pub fn effective_ai_model<'a>(guild: &'a GuildSettings, config: &'a Config) -> &'a str {
+    guild
+        .ai_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&config.ai.model)
+}
+
+/// Effective rate limit delay in milliseconds.
+pub fn effective_ai_delay_ms(guild: &GuildSettings, config: &Config) -> u64 {
+    guild.ai_delay_ms.unwrap_or(config.ai.delay_ms)
+}
+
+/// Effective AI enabled flag.
+pub fn effective_ai_enabled(guild: &GuildSettings, config: &Config) -> bool {
+    guild.ai_enabled.unwrap_or(config.ai.enabled)
 }
 
 /// Collapse every guild's configuration into the set of targets to poll, each
@@ -291,6 +329,7 @@ mod tests {
             },
             tracker: TrackerCfg::default(),
             games: Vec::new(),
+            ai: Default::default(),
         }
     }
 
