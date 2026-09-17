@@ -20,6 +20,8 @@ pub struct Config {
     pub tracker: Tracker,
     #[serde(default)]
     pub games: Vec<Game>,
+    #[serde(default)]
+    pub ai: AiConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +86,38 @@ pub struct Game {
     pub platforms: Vec<String>,
 }
 
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AiConfig {
+    /// Optional default NVIDIA API key.
+    #[serde(default)]
+    pub nvidia_api_key: Option<String>,
+    /// Model to query on NVIDIA NIM (default: "z-ai/glm-5-3-flash").
+    #[serde(default = "defaults::ai_model")]
+    pub model: String,
+    /// Rate limit delay in milliseconds between requests.
+    #[serde(default = "defaults::ai_delay_ms")]
+    pub delay_ms: u64,
+    /// Optional path to Ghidra analyzeHeadless executable.
+    #[serde(default)]
+    pub ghidra_path: Option<String>,
+    /// Whether AI diff analysis is enabled.
+    #[serde(default = "defaults::ai_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            nvidia_api_key: None,
+            model: defaults::ai_model(),
+            delay_ms: defaults::ai_delay_ms(),
+            ghidra_path: None,
+            enabled: defaults::ai_enabled(),
+        }
+    }
+}
+
 mod defaults {
     pub fn poll_interval_secs() -> u64 {
         300
@@ -109,6 +143,15 @@ mod defaults {
     }
     pub fn user_agent() -> String {
         concat!("eac-tracker/", env!("CARGO_PKG_VERSION")).to_string()
+    }
+    pub fn ai_model() -> String {
+        crate::ai::DEFAULT_MODEL.to_string()
+    }
+    pub fn ai_delay_ms() -> u64 {
+        crate::ai::DEFAULT_DELAY_MS
+    }
+    pub fn ai_enabled() -> bool {
+        true
     }
 }
 
@@ -146,6 +189,7 @@ impl Config {
             },
             tracker: Tracker::default(),
             games: Vec::new(),
+            ai: AiConfig::default(),
         };
         cfg.apply_environment();
         cfg.validate()?;
@@ -162,6 +206,26 @@ impl Config {
             && let Ok(parsed) = guild.trim().parse::<u64>()
         {
             self.discord.guild_id = Some(parsed);
+        }
+        if let Ok(key) = std::env::var("NVIDIA_API_KEY")
+            && !key.trim().is_empty()
+        {
+            self.ai.nvidia_api_key = Some(key.trim().to_string());
+        }
+        if let Ok(model) = std::env::var("AI_MODEL")
+            && !model.trim().is_empty()
+        {
+            self.ai.model = model.trim().to_string();
+        }
+        if let Ok(delay_str) = std::env::var("AI_DELAY_MS")
+            && let Ok(delay) = delay_str.trim().parse::<u64>()
+        {
+            self.ai.delay_ms = delay;
+        }
+        if let Ok(ghidra) = std::env::var("GHIDRA_PATH")
+            && !ghidra.trim().is_empty()
+        {
+            self.ai.ghidra_path = Some(ghidra.trim().to_string());
         }
     }
 

@@ -20,7 +20,7 @@ poll_interval_secs = 300
 request_timeout_secs = 30
 # Per-guild defaults, overridable with /eac set.
 announce_on_first_seen = false
-attach_raw_response = true
+attach_raw_response = false
 max_attachment_bytes = 9500000
 # Where the bot keeps its own files, relative to the working directory.
 state_path = "state.json"
@@ -39,3 +39,13 @@ archive_path = "archive"
 # product_id = "9e8b37541e614575b4de303d2c2e44cf"
 # deployment_id = "35e06571d8ab4de4b98519b624125459"
 # platforms = ["win64"]
+
+[ai]
+# NVIDIA NIM API key for automated binary diff analysis & reverse-engineering assistance.
+# Can also be set via NVIDIA_API_KEY environment variable or configured directly in Discord via /eac.
+# nvidia_api_key = "nvapi-..."
+# model = "z-ai/glm-5-3-flash"
+# delay_ms = 1000
+# Optional path to Ghidra analyzeHeadless script. Defaults to auto-detection.
+# ghidra_path = "/opt/ghidra/support/analyzeHeadless"
+# enabled = true

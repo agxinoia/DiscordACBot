@@ -53,7 +53,7 @@ impl Store {
     /// file is an error rather than a silent reset: quietly starting from
     /// scratch would re-announce everything.
     pub fn load(path: &Path) -> Result<Self> {
-        let state = match std::fs::read_to_string(path) {
+        let mut state: State = match std::fs::read_to_string(path) {
             Ok(raw) if raw.trim().is_empty() => State::default(),
             Ok(raw) => serde_json::from_str(&raw)
                 .with_context(|| format!("parsing state file {}", path.display()))?,
@@ -62,6 +62,10 @@ impl Store {
                 return Err(e).with_context(|| format!("reading state file {}", path.display()));
             }
         };
+        for seen in state.targets.values_mut() {
+            seen.modules
+                .retain(|m| crate::eac::is_plausible_module_filename(&m.name));
+        }
         Ok(Self {
             path: path.to_path_buf(),
             state,
@@ -144,6 +148,30 @@ mod tests {
         assert_eq!(seen.modules.len(), 1, "modules persist for later diffing");
         assert_eq!(seen.modules[0].name, "driver.sys");
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn loads_and_sanitises_historical_phantom_modules() {
+        let path = temp_path("sanitise");
+        let raw = r#"{
+            "targets": {
+                "p/d/win64": {
+                    "digest": "abc",
+                    "size": 12345,
+                    "seen_at": 100,
+                    "modules": [
+                        {"name": "XW.So", "arch": null, "size": null, "hash": null},
+                        {"name": "driver.sys", "arch": "x64", "size": 100, "hash": "h1"}
+                    ]
+                }
+            }
+        }"#;
+        std::fs::write(&path, raw).unwrap();
+        let store = Store::load(&path).unwrap();
+        let seen = store.get("p/d/win64").unwrap();
+        assert_eq!(seen.modules.len(), 1);
+        assert_eq!(seen.modules[0].name, "driver.sys");
         std::fs::remove_file(&path).unwrap();
     }
 

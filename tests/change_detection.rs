@@ -88,6 +88,7 @@ fn config_with_archive(base: &str, state_path: &str, archive_path: &str) -> Arc<
             ..Default::default()
         },
         games: vec![game()],
+        ai: Default::default(),
     })
 }
 

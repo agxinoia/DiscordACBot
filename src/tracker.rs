@@ -9,7 +9,7 @@ use crate::embed;
 use crate::settings::{self, SettingsStore, Subscriber};
 use crate::state::{Seen, Store, now_unix, target_key};
 use anyhow::{Context, Result};
-use serenity::builder::{CreateAttachment, CreateMessage};
+use serenity::builder::{CreateAttachment, CreateMessage, EditMessage};
 use serenity::http::Http;
 use serenity::model::id::ChannelId;
 use std::sync::{Arc, Mutex};
@@ -78,6 +78,10 @@ impl Tracker {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn archive(&self) -> Option<&Archive> {
+        self.archive.as_ref()
     }
 
     /// Render `/eac status` as plain text.
@@ -285,7 +289,74 @@ impl Tracker {
     ) -> Result<()> {
         let tracker = &self.config.tracker;
         let attach_raw = subscriber.attach_raw_response;
-        let embed = embed::build_update_embed(
+
+        let mut ai_summary: Option<String> = None;
+        let guild_settings = self.settings.guild(subscriber.guild_id);
+        let ai_enabled = settings::effective_ai_enabled(&guild_settings, &self.config);
+        let maybe_key = settings::effective_nvidia_key(&guild_settings, &self.config);
+
+        // Stage 1: Send immediate notification upon detecting change before launching deep processing
+        let initial_msg = if ai_enabled && outcome.diff.is_some() && maybe_key.is_some() {
+            let initial_embed = serenity::all::CreateEmbed::new()
+                .title(format!("🚨 EAC Update Detected: {} ({})", game.name, platform))
+                .description(format!(
+                    "**New Module Hash**: `{}`\n**Payload Size**: {}\n\n⏳ *Change detected on live CDN. Archiving binary and initiating Ghidra decompilation & NVIDIA NIM AI analysis...*",
+                    eac::short_hash(&outcome.snapshot.hashes.sha256),
+                    embed::human_bytes(outcome.snapshot.size()),
+                ))
+                .color(0xFEE75C);
+
+            ChannelId::new(subscriber.channel_id)
+                .send_message(http, CreateMessage::new().embed(initial_embed))
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        if ai_enabled && outcome.diff.is_some() {
+            if let Some(key) = maybe_key {
+                let model = settings::effective_ai_model(&guild_settings, &self.config);
+                let delay = settings::effective_ai_delay_ms(&guild_settings, &self.config);
+
+                let diff_text = format!("{:?}", outcome.diff);
+                let ghidra_summary = if let Some(archive) = self.archive.as_ref() {
+                    let binary_path = archive.blob_path(&outcome.snapshot.hashes.sha256);
+                    if binary_path.exists() {
+                        let ghidra_bin = crate::ghidra::find_ghidra(self.config.ai.ghidra_path.as_deref());
+                        let analysis = crate::ghidra::analyze_binary(
+                            ghidra_bin.as_deref(),
+                            &binary_path,
+                            archive.root(),
+                        ).await.ok();
+                        analysis.map(|a| a.summary_text)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                match crate::ai::summarize_diff(
+                    key,
+                    model,
+                    delay,
+                    &game.name,
+                    platform,
+                    &diff_text,
+                    ghidra_summary.as_deref(),
+                ).await {
+                    Ok(summary) => {
+                        ai_summary = Some(summary);
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "AI diff analysis request failed");
+                    }
+                }
+            }
+        }
+
+        let embed = embed::build_update_embed_with_ai(
             game,
             platform,
             &outcome.snapshot,
@@ -294,29 +365,56 @@ impl Tracker {
             tracker.max_attachment_bytes,
             attach_raw,
             tracker.thumbnail_url.as_deref(),
+            ai_summary.as_deref(),
         );
 
-        let mut message = CreateMessage::new().embed(embed);
-
-        if attach_raw {
-            let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
-            if parts.len() > MAX_ATTACHMENTS {
-                warn!(
-                    parts = parts.len(),
-                    "response exceeds {MAX_ATTACHMENTS} attachments; truncating upload"
-                );
+        if let Some(mut initial) = initial_msg {
+            let mut edit = EditMessage::new().embed(embed.clone());
+            if attach_raw {
+                let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
+                let total = parts.len();
+                for (i, part) in parts.into_iter().take(MAX_ATTACHMENTS).enumerate() {
+                    let filename = attachment_name(&game.name, platform, i + 1, total);
+                    edit = edit.new_attachment(CreateAttachment::bytes(part.to_vec(), filename));
+                }
             }
-            let total = parts.len();
-            for (i, part) in parts.into_iter().take(MAX_ATTACHMENTS).enumerate() {
-                let filename = attachment_name(&game.name, platform, i + 1, total);
-                message = message.add_file(CreateAttachment::bytes(part.to_vec(), filename));
+            if let Err(e) = initial.edit(http, edit).await {
+                warn!(error = ?e, "failed to edit initial detection alert; falling back to new message");
+                let mut message = CreateMessage::new().embed(embed);
+                if attach_raw {
+                    let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
+                    let total = parts.len();
+                    for (i, part) in parts.into_iter().take(MAX_ATTACHMENTS).enumerate() {
+                        let filename = attachment_name(&game.name, platform, i + 1, total);
+                        message = message.add_file(CreateAttachment::bytes(part.to_vec(), filename));
+                    }
+                }
+                ChannelId::new(subscriber.channel_id)
+                    .send_message(http, message)
+                    .await
+                    .context("sending update message")?;
             }
+        } else {
+            let mut message = CreateMessage::new().embed(embed);
+            if attach_raw {
+                let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
+                if parts.len() > MAX_ATTACHMENTS {
+                    warn!(
+                        parts = parts.len(),
+                        "response exceeds {MAX_ATTACHMENTS} attachments; truncating upload"
+                    );
+                }
+                let total = parts.len();
+                for (i, part) in parts.into_iter().take(MAX_ATTACHMENTS).enumerate() {
+                    let filename = attachment_name(&game.name, platform, i + 1, total);
+                    message = message.add_file(CreateAttachment::bytes(part.to_vec(), filename));
+                }
+            }
+            ChannelId::new(subscriber.channel_id)
+                .send_message(http, message)
+                .await
+                .context("sending update message")?;
         }
-
-        ChannelId::new(subscriber.channel_id)
-            .send_message(http, message)
-            .await
-            .context("sending update message")?;
         Ok(())
     }
 }
@@ -332,7 +430,7 @@ fn attachment_name(game: &str, platform: &str, index: usize, total: usize) -> St
 }
 
 /// Reduce arbitrary text to a filename-safe token.
-fn slug(s: &str) -> String {
+pub fn slug(s: &str) -> String {
     let mut out: String = s
         .chars()
         .map(|c| {

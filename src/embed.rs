@@ -297,11 +297,6 @@ fn payload_fields(
             format!("`{}`", snapshot.hashes.sha256),
             false,
         ),
-        (
-            "MD5 / SHA-1".to_string(),
-            format!("`{}`\n`{}`", snapshot.hashes.md5, snapshot.hashes.sha1),
-            false,
-        ),
     ];
 
     let mut payload = vec![format!(
@@ -385,6 +380,24 @@ pub fn build_update_embed(
     attach_raw: bool,
     thumbnail: Option<&str>,
 ) -> CreateEmbed {
+    build_update_embed_with_ai(
+        game, platform, snapshot, previous, diff, max_part, attach_raw, thumbnail, None,
+    )
+}
+
+/// The embed posted when a target digest changes, including optional AI analysis.
+#[allow(clippy::too_many_arguments)]
+pub fn build_update_embed_with_ai(
+    game: &Game,
+    platform: &str,
+    snapshot: &Snapshot,
+    previous: Option<&str>,
+    diff: Option<&Diff>,
+    max_part: u64,
+    attach_raw: bool,
+    thumbnail: Option<&str>,
+    ai_summary: Option<&str>,
+) -> CreateEmbed {
     let mut embed = CreateEmbed::new()
         .title(format!("EAC Update Detected for *{}*", game.name))
         .url(&snapshot.url)
@@ -396,6 +409,13 @@ pub fn build_update_embed(
     }
 
     let mut fields = payload_fields(game, platform, snapshot, diff, max_part, attach_raw);
+    if let Some(summary) = ai_summary.filter(|s| !s.trim().is_empty()) {
+        fields.push((
+            "AI Diff Analysis (NVIDIA NIM)".to_string(),
+            truncate(summary, MAX_FIELD_VALUE),
+            false,
+        ));
+    }
     if let Some(previous) = previous {
         fields.push((
             "Previous Hash".to_string(),
@@ -626,8 +646,6 @@ mod tests {
         assert!(sha.1.contains(&snapshot.hashes.sha256), "full digest shown");
         assert_eq!(snapshot.hashes.sha256.len(), 64);
 
-        let other = fields.iter().find(|(n, _, _)| n == "MD5 / SHA-1").unwrap();
-        assert!(other.1.contains(&snapshot.hashes.md5));
-        assert!(other.1.contains(&snapshot.hashes.sha1));
+        assert!(fields.iter().all(|(n, _, _)| n != "MD5 / SHA-1"));
     }
 }

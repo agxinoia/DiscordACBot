@@ -245,6 +245,23 @@ Run `/eac dashboard` in your server to launch the interactive control panel:
 - **Known Game Presets & Insights**: Select any preset (Apex Legends, ARC Raiders, Fortnite, Rust) to view architectural insights, CDN endpoints, and module notes.
 - **Real-Time Live Probes**: Test candidate platforms on the live Epic Games CDN to view published module sizes and stub detection before tracking.
 - **1-Click Tracking**: Track any preset or click **🚀 Track All Presets** to auto-detect platforms and begin monitoring immediately.
+- **AI Reverse Engineering & Diff Analysis (NVIDIA NIM)**:
+  - Click **Configure AI** to open a secure Discord modal to set or update your NVIDIA API key, chosen model (`z-ai/glm-5-3-flash`), and rate-limiting delay interval (in milliseconds).
+  - Click **Test AI** to run an ephemeral connectivity check against the NVIDIA NIM API.
+  - When new modules land, the bot utilizes the configured model and headless Ghidra (`analyzeHeadless`) to decompile, analyze differences, and embed an architectural summary in update notifications.
+
+### Devirtualization & Reverse-Engineering Pipeline
+
+To dissect virtualized modules (e.g. EAC proprietary VM, VMProtect, Themida) and reconstruct native logic:
+
+- **Interactive Devirtualization**: In `/eac dashboard`, navigate to any tracked game and click **Devirtualize**, or run:
+  ```
+  /eac devirt game:<game> [platform:<platform>]
+  ```
+- **Static PE & Protection Analysis**: Scans carved modules for section entropy anomalies (entropy > 7.1), executable + writable (`W+X`) sections, VM entry context saves (`pushfq` + register sequences), and control flow flattening dispatch loops.
+- **Headless Ghidra Pipeline**: Automatically launches `analyzeHeadless` with `scripts/ghidra_devirt.py` to decompile entry points, indirect jump dispatchers, and export symbol tables.
+- **AI Decompilation & Logic Reconstruction**: Dispatches disassembly snippets and decompiled loops to NVIDIA NIM (`z-ai/glm-5-3-flash`) to identify the virtual architecture, decode bytecode opcode semantics, reconstruct high-level C pseudo-code, and flag anti-tamper or integrity checks.
+- **Comprehensive Reports**: Posts an embed summary to Discord and attaches the full devirtualization markdown report (`devirt_<game>_<platform>.md`).
 
 ### Two EAC backends
 
@@ -286,8 +303,7 @@ Beyond "the hash changed", each update reports as much as the payload allows.
 All of it is best-effort and never fails a poll.
 
 **Always**
-- Full MD5, SHA-1 and SHA-256, untruncated, for cross-referencing external
-  sample databases.
+- Full SHA-256, untruncated, for change detection and verification (archive records retain MD5, SHA-1, and SHA-256).
 - TLSH fuzzy hash, and the distance from the previous payload: 0 is identical,
   under ~30 a small patch, over ~200 effectively unrelated. This is what tells
   you whether an update is worth opening before you open it.
@@ -398,7 +414,7 @@ in `settings.path`; the values here apply to servers that have not set their own
 | `discord.channel_id` | unset | Fallback announce channel for servers that have not run `/eac setup`. |
 | `tracker.poll_interval_secs` | `300` | Seconds between sweeps. Minimum 30. |
 | `tracker.announce_on_first_seen` | `false` | Post an embed the first time a target is seen. Leave off so a fresh deployment does not fire one embed per target on startup. |
-| `tracker.attach_raw_response` | `true` | Attach the raw CDN response to the embed. |
+| `tracker.attach_raw_response` | `false` | Attach the raw CDN response to the embed. |
 | `tracker.max_attachment_bytes` | `9500000` | Upload chunk size, just under Discord's 10 MB per-file limit. Bodies larger than this are split into numbered parts (max 10 per message). |
 | `tracker.state_path` | `state.json` | Where last-seen digests are persisted. |
 | `tracker.settings_path` | `settings.json` | Where per-server configuration from `/eac` is persisted. |

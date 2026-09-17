@@ -12,6 +12,7 @@ use crate::embed;
 use crate::settings::{self, MIN_POLL_INTERVAL_SECS};
 use crate::tracker::Tracker;
 use serenity::all::{
+    ActionRowComponent, CreateAttachment, ModalInteraction,
     AutocompleteChoice, ChannelType, CommandDataOption, CommandDataOptionValue,
     CommandInteraction, CommandOptionType, ComponentInteraction, ComponentInteractionDataKind,
     Context, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
@@ -39,6 +40,22 @@ const SETTABLE: &[(&str, &str)] = &[
     (
         "poll_interval_secs",
         "Seconds between sweeps (minimum 30, applies bot-wide)",
+    ),
+    (
+        "nvidia_api_key",
+        "Set NVIDIA API key (nvapi-...) for reverse-engineering analysis",
+    ),
+    (
+        "ai_model",
+        "Set AI model name on NVIDIA NIM (e.g. z-ai/glm-5-3-flash)",
+    ),
+    (
+        "ai_delay_ms",
+        "Rate limit delay between NVIDIA API requests in milliseconds",
+    ),
+    (
+        "ai_enabled",
+        "Enable or disable AI change analysis (true/false)",
     ),
 ];
 
@@ -243,6 +260,22 @@ impl Handler {
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::SubCommand,
+                    "devirt",
+                    "Run Ghidra & NVIDIA AI devirtualization and reverse-engineering pipeline on a module",
+                )
+                .add_sub_option(game_option(true))
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "platform",
+                        "Platform to devirtualize (default: first tracked platform)",
+                    )
+                    .required(false),
+                ),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
                     "set",
                     "Change a tracker option",
                 )
@@ -329,6 +362,7 @@ impl Handler {
             "config" => self.reply_config(ctx, cmd, guild_id).await,
             "status" => self.reply_status(ctx, cmd).await,
             "check" => self.reply_check(ctx, cmd, guild_id, options).await,
+            "devirt" => self.reply_devirt(ctx, cmd, guild_id, options).await,
             "set" => self.reply_set(ctx, cmd, guild_id, options).await,
             other => {
                 error!(subcommand = %other, "unknown subcommand");
@@ -897,6 +931,62 @@ impl Handler {
                     )
                     .await;
             }
+            "dash:btn:configure_ai" => {
+                let settings = self.tracker.settings();
+                let guild = settings.guild(guild_id);
+                let config = self.tracker.config();
+                let current_key = settings::effective_nvidia_key(&guild, config);
+                let current_model = settings::effective_ai_model(&guild, config);
+                let current_delay = settings::effective_ai_delay_ms(&guild, config);
+
+                let modal = dashboard::build_ai_modal(current_key, current_model, current_delay);
+                let _ = mc
+                    .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                    .await;
+            }
+            "dash:btn:test_ai" => {
+                let _ = mc.defer_ephemeral(&ctx.http).await;
+                let settings = self.tracker.settings();
+                let guild = settings.guild(guild_id);
+                let config = self.tracker.config();
+                let current_key = settings::effective_nvidia_key(&guild, config);
+                let current_model = settings::effective_ai_model(&guild, config);
+                let current_delay = settings::effective_ai_delay_ms(&guild, config);
+
+                let Some(key) = current_key else {
+                    let _ = mc
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content("⚠️ No NVIDIA API key configured. Click **Configure AI** to provide a key first.")
+                        )
+                        .await;
+                    return;
+                };
+
+                match crate::ai::test_connection(key, current_model, current_delay).await {
+                    Ok(reply) => {
+                        let _ = mc
+                            .edit_response(
+                                &ctx.http,
+                                EditInteractionResponse::new().content(format!(
+                                    "✅ **NVIDIA NIM API Connection Successful!**\n• Model: `{current_model}`\n• Rate Limit Delay: `{current_delay}ms`\n• Response: {reply}"
+                                )),
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = mc
+                            .edit_response(
+                                &ctx.http,
+                                EditInteractionResponse::new().content(format!(
+                                    "❌ **NVIDIA API Connection Failed:**\n`{e}`"
+                                )),
+                            )
+                            .await;
+                    }
+                }
+            }
             "dash:btn:add_all_presets" => {
                 if let Err(e) = mc
                     .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
@@ -1039,6 +1129,19 @@ impl Handler {
                             .components(components),
                     )
                     .await;
+            }
+            id if id.starts_with("dash:btn:devirt_game:") => {
+                let name = &id["dash:btn:devirt_game:".len()..];
+                let Some(game) = self.find_game(guild_id, name) else {
+                    return;
+                };
+                let _ = mc.defer_ephemeral(&ctx.http).await;
+                let (embed, attachment) = self.run_devirt_for_game(guild_id, &game, None).await;
+                let mut resp = EditInteractionResponse::new().embed(embed);
+                if let Some(att) = attachment {
+                    resp = resp.new_attachment(att);
+                }
+                let _ = mc.edit_response(&ctx.http, resp).await;
             }
             id if id.starts_with("dash:btn:check_game:") => {
                 let name = &id["dash:btn:check_game:".len()..];
@@ -1191,6 +1294,114 @@ impl Handler {
                     .await;
             }
             _ => {}
+        }
+    }
+
+    async fn handle_ai_modal_submit(&self, ctx: &Context, modal: &ModalInteraction) {
+        let Some(guild_id) = modal.guild_id.map(|g| g.get()) else {
+            return;
+        };
+        if !permits_manage(modal.member.as_ref().and_then(|m| m.permissions)) {
+            let _ = modal
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("You need the **Manage Server** permission to configure AI.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        let mut new_key: Option<String> = None;
+        let mut new_model: Option<String> = None;
+        let mut new_delay: Option<u64> = None;
+
+        for row in &modal.data.components {
+            for comp in &row.components {
+                if let ActionRowComponent::InputText(input) = comp {
+                    match input.custom_id.as_str() {
+                        "ai_key" => {
+                            let val = input.value.as_deref().unwrap_or("").trim();
+                            if !val.is_empty() {
+                                if val.eq_ignore_ascii_case("clear") || val.eq_ignore_ascii_case("none") {
+                                    new_key = Some("".to_string());
+                                } else {
+                                    new_key = Some(val.to_string());
+                                }
+                            }
+                        }
+                        "ai_model" => {
+                            let val = input.value.as_deref().unwrap_or("").trim();
+                            if !val.is_empty() {
+                                new_model = Some(val.to_string());
+                            }
+                        }
+                        "ai_delay" => {
+                            let val = input.value.as_deref().unwrap_or("").trim();
+                            if let Ok(num) = val.parse::<u64>() {
+                                new_delay = Some(num);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let edit_res = self.tracker.settings().edit_guild(guild_id, |g| {
+            if let Some(k) = new_key {
+                if k.is_empty() {
+                    g.nvidia_api_key = None;
+                } else {
+                    g.nvidia_api_key = Some(k);
+                }
+            }
+            if let Some(m) = new_model {
+                g.ai_model = Some(m);
+            }
+            if let Some(d) = new_delay {
+                g.ai_delay_ms = Some(d);
+            }
+        });
+
+        match edit_res {
+            Ok(()) => {
+                let settings = self.tracker.settings();
+                let guild = settings.guild(guild_id);
+                let config = self.tracker.config();
+                let eff_key = settings::effective_nvidia_key(&guild, config);
+                let eff_model = settings::effective_ai_model(&guild, config);
+                let eff_delay = settings::effective_ai_delay_ms(&guild, config);
+
+                let _ = modal
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!(
+                                    "⚙️ **AI Settings Updated Successfully!**\n• **NVIDIA API Key**: {}\n• **Active Model**: `{eff_model}`\n• **Rate Limit Delay**: `{eff_delay}ms`\n*Changes are saved to `settings.json` and active immediately.*",
+                                    eff_key.map(crate::ai::mask_key).unwrap_or_else(|| "*(not set)*".to_string())
+                                ))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                let _ = modal
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("❌ Failed to save AI settings: `{e}`"))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -1359,6 +1570,54 @@ impl Handler {
                     return respond(ctx, cmd, format!("`{value}` is not a number.")).await;
                 }
             },
+            "nvidia_api_key" => {
+                let key_str = if value.eq_ignore_ascii_case("clear") || value.eq_ignore_ascii_case("none") || value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                self.tracker
+                    .settings()
+                    .edit_guild(guild_id, |g| {
+                        g.nvidia_api_key = key_str.clone();
+                    })
+                    .map(|()| match key_str {
+                        Some(k) => format!("NVIDIA API key updated to `{}`.", crate::ai::mask_key(&k)),
+                        None => "NVIDIA API key cleared.".to_string(),
+                    })
+            }
+            "ai_model" => {
+                let model_str = value.to_string();
+                self.tracker
+                    .settings()
+                    .edit_guild(guild_id, |g| {
+                        g.ai_model = Some(model_str.clone());
+                    })
+                    .map(|()| format!("AI model set to `{model_str}`."))
+            }
+            "ai_delay_ms" => match value.parse::<u64>() {
+                Ok(ms) => self
+                    .tracker
+                    .settings()
+                    .edit_guild(guild_id, |g| {
+                        g.ai_delay_ms = Some(ms);
+                    })
+                    .map(|()| format!("AI rate limit delay set to **{ms}ms**.")),
+                Err(_) => {
+                    return respond(ctx, cmd, format!("`{value}` is not a valid millisecond number.")).await;
+                }
+            }
+            "ai_enabled" => {
+                let Some(parsed) = parse_bool(value) else {
+                    return respond(ctx, cmd, format!("`{value}` is not true or false.")).await;
+                };
+                self.tracker
+                    .settings()
+                    .edit_guild(guild_id, |g| {
+                        g.ai_enabled = Some(parsed);
+                    })
+                    .map(|()| format!("AI diff analysis is now **{}**.", if parsed { "enabled" } else { "disabled" }))
+            }
             other => {
                 return respond(ctx, cmd, format!("Unknown option `{other}`.")).await;
             }
@@ -1371,6 +1630,171 @@ impl Handler {
                 respond(ctx, cmd, format!("Could not save that: {e}")).await
             }
         }
+    }
+
+    async fn run_devirt_for_game(
+        &self,
+        guild_id: u64,
+        game: &Game,
+        platform_opt: Option<&str>,
+    ) -> (CreateEmbed, Option<CreateAttachment>) {
+        let platform = platform_opt
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| p.trim().to_ascii_lowercase())
+            .or_else(|| game.platforms.first().cloned())
+            .unwrap_or_else(|| "win64".to_string());
+
+        let outcome = match self.tracker.check(game, &platform).await {
+            Ok(o) => o,
+            Err(e) => {
+                let embed = CreateEmbed::new()
+                    .title(format!("Devirtualization Failed: {}", game.name))
+                    .description(format!("Failed to fetch or check target module: `{e}`"))
+                    .color(0xED4245);
+                return (embed, None);
+            }
+        };
+
+        let Some(archive) = self.tracker.archive() else {
+            let embed = CreateEmbed::new()
+                .title(format!("Devirtualization Failed: {}", game.name))
+                .description("Payload archiving is disabled in config. Enable `archive_path` to preserve binaries for Ghidra and devirtualization analysis.")
+                .color(0xED4245);
+            return (embed, None);
+        };
+
+        let binary_path = archive.blob_path(&outcome.snapshot.hashes.sha256);
+        if !binary_path.exists() {
+            let embed = CreateEmbed::new()
+                .title(format!("Devirtualization Failed: {}", game.name))
+                .description("Binary blob not found in archive.")
+                .color(0xED4245);
+            return (embed, None);
+        }
+
+        let settings = self.tracker.settings();
+        let guild = settings.guild(guild_id);
+        let config = self.tracker.config();
+        let key = settings::effective_nvidia_key(&guild, config);
+        let model = settings::effective_ai_model(&guild, config);
+        let delay = settings::effective_ai_delay_ms(&guild, config);
+        let ghidra_path = config.ai.ghidra_path.as_deref();
+        let module_name = outcome.snapshot.modules.first().map(|m| m.name.as_str()).unwrap_or(&game.name);
+
+        let devirt_res = match crate::devirtualize::run_devirtualization_pipeline(
+            &game.name,
+            &platform,
+            module_name,
+            &binary_path,
+            archive.root(),
+            ghidra_path,
+            key,
+            model,
+            delay,
+        ).await {
+            Ok(r) => r,
+            Err(e) => {
+                let embed = CreateEmbed::new()
+                    .title(format!("Devirtualization Error: {}", game.name))
+                    .description(format!("Pipeline execution error: `{e}`"))
+                    .color(0xED4245);
+                return (embed, None);
+            }
+        };
+
+        let mut embed = CreateEmbed::new()
+            .title(format!("🔬 Devirtualization & Reverse-Engineering: {}", game.name))
+            .description(format!("Target: `{module_name}` ({platform}) • File Size: {}", embed::human_bytes(devirt_res.protection.file_size as u64)))
+            .color(0x5865F2)
+            .field(
+                "Binary Architecture & Protection",
+                format!(
+                    "• Arch: `{}`\n• Protector: `{}`\n• Control Flow Flattening: `{}`",
+                    devirt_res.protection.architecture,
+                    devirt_res.protection.suspected_protector.as_deref().unwrap_or("Custom / Proprietary"),
+                    if devirt_res.protection.has_control_flow_flattening { "Detected" } else { "None" }
+                ),
+                false,
+            );
+
+        if !devirt_res.protection.suspicious_sections.is_empty() {
+            let sec_lines: Vec<String> = devirt_res.protection.suspicious_sections.iter().take(5).map(|s| {
+                format!("• `{:<8}`: entropy {:.2} | {}", s.name, s.entropy, s.indicator)
+            }).collect();
+            embed = embed.field("Suspicious / Virtual Sections", sec_lines.join("\n"), false);
+        }
+
+        if !devirt_res.protection.vm_candidates.is_empty() {
+            let cand_lines: Vec<String> = devirt_res.protection.vm_candidates.iter().take(4).map(|c| {
+                format!("• RVA `+0x{:X}` [{}] — `{}`", c.rva, c.pattern_type, c.snippet_hex)
+            }).collect();
+            embed = embed.field("VM Entry / Dispatcher Stubs", cand_lines.join("\n"), false);
+        }
+
+        let ghidra_status = if devirt_res.ghidra_decompilation.is_some() {
+            "✅ Headless Ghidra decompilation and CFG extraction succeeded."
+        } else if crate::ghidra::find_ghidra(ghidra_path).is_some() {
+            "⚠️ Headless Ghidra executed but returned no exportable functions."
+        } else {
+            "ℹ️ Headless Ghidra not installed on host. Using static PE heuristics."
+        };
+        embed = embed.field("Ghidra Decompilation Engine", ghidra_status, false);
+
+        let mut attachment = None;
+        if let Some(ai) = devirt_res.ai_analysis {
+            let summary_snippet = if ai.len() > 1000 {
+                let end = ai.char_indices().map(|(i, _)| i).take_while(|i| *i < 950).last().unwrap_or(ai.len());
+                format!("{}...\n*(See attached report for full decompilation & bytecode mapping)*", &ai[..end])
+            } else {
+                ai.clone()
+            };
+            embed = embed.field(format!("NVIDIA NIM AI Analysis (`{model}`)", model = model), summary_snippet, false);
+
+            let full_report = format!(
+                "# Devirtualization & Reverse-Engineering Report\n\n                 - **Game**: {game}\n                 - **Platform**: {platform}\n                 - **Module**: {module_name}\n                 - **Model**: {model}\n                 - **SHA-256**: {sha}\n\n                 ## Static VM Protection Summary\n                 {summary}\n\n                 ## AI Devirtualization & Native Logic Recovery\n                 {ai}\n",
+                game = game.name,
+                platform = platform,
+                module_name = module_name,
+                model = model,
+                sha = outcome.snapshot.hashes.sha256,
+                summary = devirt_res.protection.summary,
+                ai = ai,
+            );
+            let file_name = format!("devirt_{}_{}.md", crate::tracker::slug(&game.name), crate::tracker::slug(&platform));
+            attachment = Some(CreateAttachment::bytes(full_report.into_bytes(), file_name));
+        } else {
+            embed = embed.field(
+                "NVIDIA NIM AI Analysis",
+                "No NVIDIA API key configured. Click **Configure AI** on `/eac dashboard` to enable AI devirtualization synthesis.",
+                false,
+            );
+        }
+
+        (embed, attachment)
+    }
+
+    async fn reply_devirt(
+        &self,
+        ctx: &Context,
+        cmd: &CommandInteraction,
+        guild_id: u64,
+        options: &[CommandDataOption],
+    ) -> serenity::Result<()> {
+        let name = string_option(options, "game").unwrap_or_default();
+        let Some(game) = self.find_game(guild_id, &name) else {
+            return respond(ctx, cmd, format!("No tracked game matches `{name}`.")).await;
+        };
+
+        cmd.defer_ephemeral(&ctx.http).await?;
+        let platform = string_option(options, "platform");
+        let (embed, attachment) = self.run_devirt_for_game(guild_id, &game, platform.as_deref()).await;
+
+        let mut resp = EditInteractionResponse::new().embed(embed);
+        if let Some(att) = attachment {
+            resp = resp.new_attachment(att);
+        }
+        cmd.edit_response(&ctx.http, resp).await?;
+        Ok(())
     }
 
     async fn reply_check(
@@ -1491,6 +1915,9 @@ impl EventHandler for Handler {
             Interaction::Component(mc) if mc.data.custom_id == SELECT_KNOWN => {
                 self.handle_selection(&ctx, &mc).await;
             }
+            Interaction::Modal(modal) if modal.data.custom_id == "dash:modal:ai_config" => {
+                self.handle_ai_modal_submit(&ctx, &modal).await;
+            }
             _ => {}
         }
     }
@@ -1589,7 +2016,7 @@ mod tests {
             assert!(
                 matches!(
                     *name,
-                    "announce_on_first_seen" | "attach_raw_response" | "poll_interval_secs"
+                    "announce_on_first_seen" | "attach_raw_response" | "poll_interval_secs" | "nvidia_api_key" | "ai_model" | "ai_delay_ms" | "ai_enabled"
                 ),
                 "no handler branch for {name}"
             );
@@ -1661,14 +2088,14 @@ mod tests {
             .map(|o| o["name"].as_str().unwrap())
             .collect();
         for expected in [
-            "dashboard", "setup", "add", "browse", "remove", "list", "config", "status", "check", "set",
+            "dashboard", "setup", "add", "browse", "remove", "list", "config", "status", "check", "set", "devirt",
         ] {
             assert!(names.contains(&expected), "missing /eac {expected}");
         }
 
         // Every subcommand routed by handle_command must exist on the command,
         // and every subcommand on the command must be routed.
-        assert_eq!(names.len(), 10, "a subcommand was added without a route");
+        assert_eq!(names.len(), 11, "a subcommand was added without a route");
     }
 
     #[test]

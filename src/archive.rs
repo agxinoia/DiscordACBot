@@ -58,7 +58,7 @@ impl Archive {
 
     /// Blobs are sharded by the first byte of the digest so no single
     /// directory accumulates thousands of entries.
-    fn blob_path(&self, sha256: &str) -> PathBuf {
+    pub fn blob_path(&self, sha256: &str) -> PathBuf {
         let shard = sha256.get(..2).unwrap_or("00");
         self.root
             .join("blobs")

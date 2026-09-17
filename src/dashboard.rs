@@ -12,7 +12,8 @@ use crate::settings;
 use crate::tracker::Tracker;
 use serenity::all::{
     ButtonStyle, ChannelType, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, Timestamp,
+    CreateInputText, CreateModal, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption,
+    InputTextStyle, Timestamp,
 };
 
 /// Clean muted theme colors for minimalist UI.
@@ -42,6 +43,20 @@ pub fn build_main_dashboard(
         .attach_raw_response
         .unwrap_or(config.tracker.attach_raw_response);
     let poll_interval = tracker.poll_interval();
+
+    let nvidia_key = settings::effective_nvidia_key(&guild, config);
+    let ai_model = settings::effective_ai_model(&guild, config);
+    let ai_delay = settings::effective_ai_delay_ms(&guild, config);
+    let ai_enabled = settings::effective_ai_enabled(&guild, config);
+    let ghidra_found = crate::ghidra::find_ghidra(config.ai.ghidra_path.as_deref()).is_some();
+
+    let ai_status_desc = if !ai_enabled {
+        "Disabled"
+    } else if nvidia_key.is_some() {
+        "Active (NVIDIA API Connected)"
+    } else {
+        "Key Required (Configure below)"
+    };
 
     let games_summary = if tracked_games.is_empty() {
         "*None configured yet. Choose a preset below or click 'Track All Presets'.*".to_string()
@@ -122,6 +137,23 @@ pub fn build_main_dashboard(
             format!(
                 "{presets_overview}\n\n\
                  *Select a game below to view architecture insights, CDN endpoints, live probe results, or to track.*"
+            ),
+            false,
+        )
+        .field(
+            "AI & Reverse Engineering Engine",
+            format!(
+                "• **Status**: {}\n\
+                 • **NVIDIA API Key**: {}\n\
+                 • **Model**: `{}`\n\
+                 • **Rate Limit Delay**: `{}ms`\n\
+                 • **Headless Ghidra**: {}\n  \
+                 *Click 'Configure AI' below to enter/update your API key, model, or rate limit delay.*",
+                ai_status_desc,
+                nvidia_key.map(crate::ai::mask_key).unwrap_or_else(|| "*(not configured)*".to_string()),
+                ai_model,
+                ai_delay,
+                if ghidra_found { "Detected (`analyzeHeadless` available)" } else { "Not detected (PE fallback mode)" }
             ),
             false,
         )
@@ -248,10 +280,20 @@ pub fn build_main_dashboard(
         .label("Status")
         .style(ButtonStyle::Secondary);
 
+    let btn_ai = CreateButton::new("dash:btn:configure_ai")
+        .label("Configure AI")
+        .style(ButtonStyle::Secondary);
+
+    let btn_test_ai = CreateButton::new("dash:btn:test_ai")
+        .label("Test AI")
+        .style(ButtonStyle::Secondary);
+
     rows.push(CreateActionRow::Buttons(vec![
         btn_refresh,
         btn_add_all,
         btn_status,
+        btn_ai,
+        btn_test_ai,
     ]));
 
     (embed, rows)
@@ -532,6 +574,9 @@ pub fn build_tracked_manage(
         CreateButton::new(format!("dash:btn:check_game:{}", game.name))
             .label("Check Now")
             .style(ButtonStyle::Primary),
+        CreateButton::new(format!("dash:btn:devirt_game:{}", game.name))
+            .label("Devirtualize")
+            .style(ButtonStyle::Secondary),
         CreateButton::new(format!("dash:btn:remove_game:{}", game.name))
             .label("Remove Game")
             .style(ButtonStyle::Danger),
@@ -593,6 +638,52 @@ pub fn build_status_view(tracker: &Tracker) -> (CreateEmbed, Vec<CreateActionRow
     (embed, vec![CreateActionRow::Buttons(buttons)])
 }
 
+
+/// Modal dialog for configuring NVIDIA API key, model selection, and rate limiting.
+pub fn build_ai_modal(
+    current_key: Option<&str>,
+    current_model: &str,
+    current_delay_ms: u64,
+) -> CreateModal {
+    let key_placeholder = match current_key {
+        Some(k) => format!("Current: {}; leave blank to keep", crate::ai::mask_key(k)),
+        None => "nvapi-...".to_string(),
+    };
+
+    let key_input = CreateInputText::new(
+        InputTextStyle::Short,
+        "NVIDIA API Key",
+        "ai_key",
+    )
+    .placeholder(key_placeholder)
+    .required(false);
+
+    let model_input = CreateInputText::new(
+        InputTextStyle::Short,
+        "Model (e.g. z-ai/glm-5-3-flash)",
+        "ai_model",
+    )
+    .placeholder("z-ai/glm-5-3-flash")
+    .value(current_model)
+    .required(false);
+
+    let delay_input = CreateInputText::new(
+        InputTextStyle::Short,
+        "Rate Limit Delay (ms)",
+        "ai_delay",
+    )
+    .placeholder("1000")
+    .value(current_delay_ms.to_string())
+    .required(false);
+
+    CreateModal::new("dash:modal:ai_config", "Configure AI (NVIDIA NIM)")
+        .components(vec![
+            CreateActionRow::InputText(key_input),
+            CreateActionRow::InputText(model_input),
+            CreateActionRow::InputText(delay_input),
+        ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +717,7 @@ mod tests {
                 ..Default::default()
             },
             games: Vec::new(),
+            ai: Default::default(),
         });
         let settings = Arc::new(SettingsStore::load(&settings_path).unwrap());
         (Tracker::new(config, settings).unwrap(), dir)
@@ -721,5 +813,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn ai_modal_serializes_cleanly() {
+        let modal = build_ai_modal(Some("nvapi-12345678901234"), "z-ai/glm-5-3-flash", 1000);
+        let val = serde_json::to_value(&modal).unwrap();
+        assert_eq!(val["custom_id"], "dash:modal:ai_config");
+        let components = val["components"].as_array().unwrap();
+        assert_eq!(components.len(), 3);
     }
 }
