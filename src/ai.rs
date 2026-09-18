@@ -133,6 +133,41 @@ struct ChatError {
 }
 
 /// Execute a raw chat completion against the NVIDIA NIM endpoint with rate limiting.
+/// Strip reasoning scratchpad / deliberation preambles from thinking models like GLM or DeepSeek.
+pub fn clean_reasoning_preamble(s: &str) -> String {
+    let markers = ["Let me draft:", "Let's draft:", "Final Assessment:", "Final Report:", "Here is the assessment:"];
+    for m in markers {
+        if let Some((_, after)) = s.split_once(m) {
+            return after.trim().to_string();
+        }
+    }
+
+    let lines: Vec<&str> = s.lines().collect();
+    if let Some(first) = lines.first() {
+        let f = first.trim();
+        if f.starts_with("The user is asking")
+            || f.starts_with("Let me think")
+            || f.starts_with("I need to")
+            || f.starts_with("The user wants")
+            || f.starts_with("This is a legitimate")
+        {
+            for (i, line) in lines.iter().enumerate() {
+                let l = line.trim();
+                if l.starts_with("**1.")
+                    || l.starts_with("1. **")
+                    || l.starts_with("**Summary")
+                    || l.starts_with("## ")
+                    || l.starts_with("# ")
+                {
+                    return lines[i..].join("\n").trim().to_string();
+                }
+            }
+        }
+    }
+
+    s.trim().to_string()
+}
+
 pub async fn chat_completion(
     api_key: &str,
     model: &str,
@@ -338,7 +373,10 @@ pub async fn devirtualize_analysis(
         },
     ];
 
-    chat_completion(api_key, model, delay_ms, messages, 0.2, 1536).await
+    match chat_completion(api_key, model, delay_ms, messages, 0.2, 2048).await {
+        Ok(out) => Ok(clean_reasoning_preamble(&out)),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -372,3 +410,12 @@ mod tests {
         assert!(res.unwrap_err().to_string().contains("not configured"));
     }
 }
+
+    #[test]
+    fn test_clean_reasoning_preamble() {
+        let raw = "The user is asking for a security audit.\nLet me think about this.\nLet me draft:\n\n**1. Protection**\n- No VM found.";
+        assert_eq!(clean_reasoning_preamble(raw), "**1. Protection**\n- No VM found.");
+
+        let direct = "**Summary**: Clean output.\n**1. Protection**";
+        assert_eq!(clean_reasoning_preamble(direct), direct);
+    }

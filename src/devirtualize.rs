@@ -154,6 +154,17 @@ pub fn scan_pe_for_vm(bytes: &[u8]) -> VmProtectionReport {
                 }
             }
         }
+    } else {
+        let carved = crate::analysis::carve_pe_modules(bytes);
+        if let Some(primary) = carved.first() {
+            arch = primary.machine.clone();
+            suspected_protector = Some("EAC Multi-Module Container".to_string());
+        } else {
+            let overall_entropy = shannon_entropy(bytes);
+            if overall_entropy >= 7.90 {
+                suspected_protector = Some("EAC Encrypted/Compressed Container".to_string());
+            }
+        }
     }
 
     let summary = match &suspected_protector {
@@ -210,7 +221,16 @@ pub async fn run_devirtualization_pipeline(
     }
 
     // Step 1: Static heuristic scanning for VM artifacts
-    let protection = scan_pe_for_vm(&bytes);
+    let mut protection = scan_pe_for_vm(&bytes);
+    if protection.architecture == "Unknown" {
+        protection.architecture = match platform.to_lowercase().as_str() {
+            "win64" => "x86_64 (win64 target)".to_string(),
+            "win32" => "x86 (win32 target)".to_string(),
+            "linux" => "x86_64 (Linux target)".to_string(),
+            "mac" | "macos" => "x86_64 / ARM64 (macOS target)".to_string(),
+            _ => "Unknown".to_string(),
+        };
+    }
 
     // Step 2: Headless Ghidra decompilation & symbol extraction
     let ghidra_bin = crate::ghidra::find_ghidra(ghidra_path);
