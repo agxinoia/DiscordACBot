@@ -1872,6 +1872,91 @@ impl Handler {
             error!(error = ?e, "failed to answer autocomplete");
         }
     }
+    async fn handle_update_interaction(&self, ctx: &Context, mc: &ComponentInteraction) {
+        let custom_id = mc.data.custom_id.as_str();
+
+        if let Some(sha256) = custom_id.strip_prefix("update:specs:") {
+            let embed_opt = if let Some(archive) = self.tracker.archive() {
+                if let Ok(records) = archive.records() {
+                    records
+                        .into_iter()
+                        .rev()
+                        .find(|r| r.hashes.sha256 == sha256)
+                        .map(|rec| embed::build_technical_specs_from_record(&rec))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let embed = match embed_opt {
+                Some(e) => e,
+                None => CreateEmbed::new()
+                    .title("Technical Specifications")
+                    .description(format!(
+                        "Module SHA-256: `{sha256}`\n\n*(Detailed archive record is not indexed or archiving is disabled in config)*"
+                    ))
+                    .colour(0xED4245),
+            };
+
+            let _ = mc
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .embed(embed)
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        if let Some(rest) = custom_id.strip_prefix("update:devirt:") {
+            let Some(guild_id) = mc.guild_id.map(|g| g.get()) else {
+                return;
+            };
+
+            let mut parts = rest.splitn(2, ':');
+            let game_slug = parts.next().unwrap_or_default();
+            let platform = parts.next().unwrap_or("win64");
+
+            let game = self.games(guild_id).into_iter().find(|g| {
+                crate::tracker::slug(&g.name) == game_slug || g.name.eq_ignore_ascii_case(game_slug)
+            });
+
+            let Some(game) = game else {
+                let _ = mc
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("Could not locate tracked game `{game_slug}` in this server."))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+
+            if let Err(e) = mc.defer_ephemeral(&ctx.http).await {
+                error!(error = ?e, "failed to defer devirt button interaction");
+                return;
+            }
+
+            let (embed, attachment) = self.run_devirt_for_game(guild_id, &game, Some(platform)).await;
+
+            let mut resp = EditInteractionResponse::new().embed(embed);
+            if let Some(att) = attachment {
+                resp = resp.new_attachment(att);
+            }
+            if let Err(e) = mc.edit_response(&ctx.http, resp).await {
+                error!(error = ?e, "failed to edit devirt button response");
+            }
+        }
+    }
+
 }
 
 #[async_trait]
@@ -1914,6 +1999,9 @@ impl EventHandler for Handler {
             }
             Interaction::Component(mc) if mc.data.custom_id == SELECT_KNOWN => {
                 self.handle_selection(&ctx, &mc).await;
+            }
+            Interaction::Component(mc) if mc.data.custom_id.starts_with("update:") => {
+                self.handle_update_interaction(&ctx, &mc).await;
             }
             Interaction::Modal(modal) if modal.data.custom_id == "dash:modal:ai_config" => {
                 self.handle_ai_modal_submit(&ctx, &modal).await;

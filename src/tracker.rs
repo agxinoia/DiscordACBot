@@ -386,9 +386,16 @@ impl Tracker {
             tracker.thumbnail_url.as_deref(),
             ai_summary.as_deref(),
         );
+        let action_row = embed::build_update_action_row(
+            &outcome.snapshot.hashes.sha256,
+            &game.name,
+            platform,
+        );
 
         if let Some(mut initial) = initial_msg {
-            let mut edit = EditMessage::new().embed(embed.clone());
+            let mut edit = EditMessage::new()
+                .embed(embed.clone())
+                .components(vec![action_row.clone()]);
             if attach_raw {
                 let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
                 let total = parts.len();
@@ -399,7 +406,9 @@ impl Tracker {
             }
             if let Err(e) = initial.edit(http, edit).await {
                 warn!(error = ?e, "failed to edit initial detection alert; falling back to new message");
-                let mut message = CreateMessage::new().embed(embed);
+                let mut message = CreateMessage::new()
+                    .embed(embed)
+                    .components(vec![action_row]);
                 if attach_raw {
                     let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
                     let total = parts.len();
@@ -414,7 +423,9 @@ impl Tracker {
                     .context("sending update message")?;
             }
         } else {
-            let mut message = CreateMessage::new().embed(embed);
+            let mut message = CreateMessage::new()
+                .embed(embed)
+                .components(vec![action_row]);
             if attach_raw {
                 let parts = embed::split_parts(&outcome.snapshot.body, tracker.max_attachment_bytes);
                 if parts.len() > MAX_ATTACHMENTS {

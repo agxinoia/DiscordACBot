@@ -2,8 +2,10 @@
 
 use crate::analysis::{PeInfo, SignatureInfo, VersionInfo};
 use crate::config::Game;
+use crate::archive::Record;
 use crate::diff::Diff;
 use crate::eac::{ModuleEntry, Snapshot, short_hash};
+use serenity::all::{ButtonStyle, CreateActionRow, CreateButton};
 use serenity::builder::{CreateEmbed, CreateEmbedFooter};
 use serenity::model::Timestamp;
 
@@ -370,6 +372,84 @@ fn cache_footer(snapshot: &Snapshot) -> String {
 
 /// The embed posted when a target's digest changes.
 #[allow(clippy::too_many_arguments)]
+/// Compact fields for the update alert, keeping key metrics clean and scannable.
+fn compact_payload_fields(
+    game: &Game,
+    platform: &str,
+    snapshot: &Snapshot,
+    diff: Option<&Diff>,
+    max_part: u64,
+    attach_raw: bool,
+) -> Vec<Field> {
+    let mut fields = Vec::new();
+
+    // Row 1: Target, Download, Format
+    fields.push((
+        "Target".to_string(),
+        format!("**{}** (`{}`)", game.name, platform),
+        true,
+    ));
+
+    let size_str = match diff {
+        Some(d) if d.size_delta != 0 => format!(
+            "{} (`{}`)",
+            human_bytes(snapshot.size()),
+            signed_bytes(d.size_delta)
+        ),
+        _ => human_bytes(snapshot.size()),
+    };
+    fields.push(("Download".to_string(), size_str, true));
+
+    fields.push((
+        "Format".to_string(),
+        format!("{} (entropy {:.2})", snapshot.format, snapshot.entropy),
+        true,
+    ));
+
+    // Row 2: Short SHA-256, Changes / Similarity
+    fields.push((
+        "SHA-256".to_string(),
+        format!("`{}`", short_hash(&snapshot.hashes.sha256)),
+        true,
+    ));
+
+    if let Some(d) = diff {
+        if let Some(dist) = d.tlsh_distance {
+            fields.push((
+                "Similarity".to_string(),
+                format!("TLSH {} (*{}*)", dist, tlsh_verdict(dist)),
+                true,
+            ));
+        } else if d.is_uninformative() {
+            fields.push(("Changes".to_string(), "Rebuild (same size)".to_string(), true));
+        } else {
+            fields.push(("Changes".to_string(), "Modified".to_string(), true));
+        }
+    } else {
+        fields.push(("Changes".to_string(), "First sighting".to_string(), true));
+    }
+
+    if let Some(d) = diff {
+        if !d.added.is_empty() || !d.removed.is_empty() || !d.changed.is_empty() {
+            fields.push((
+                "Modules Churn".to_string(),
+                format!("`+{}` `-{}` `~{}`", d.added.len(), d.removed.len(), d.changed.len()),
+                true,
+            ));
+        }
+    }
+
+    if attach_raw {
+        fields.push((
+            "Raw Response".to_string(),
+            raw_response_summary(snapshot.size(), max_part),
+            false,
+        ));
+    }
+
+    fields
+}
+
 pub fn build_update_embed(
     game: &Game,
     platform: &str,
@@ -399,7 +479,7 @@ pub fn build_update_embed_with_ai(
     ai_summary: Option<&str>,
 ) -> CreateEmbed {
     let mut embed = CreateEmbed::new()
-        .title(format!("EAC Update Detected for *{}*", game.name))
+        .title(format!("⚡ EAC Update Detected: {} ({})", game.name, platform))
         .url(&snapshot.url)
         .colour(ACCENT)
         .timestamp(Timestamp::now());
@@ -408,18 +488,18 @@ pub fn build_update_embed_with_ai(
         embed = embed.thumbnail(url);
     }
 
-    let mut fields = payload_fields(game, platform, snapshot, diff, max_part, attach_raw);
-    if let Some(summary) = ai_summary.filter(|s| !s.trim().is_empty()) {
-        fields.push((
-            "AI Diff Analysis (NVIDIA NIM)".to_string(),
-            truncate(summary, MAX_FIELD_VALUE),
-            false,
-        ));
-    }
+    let mut fields = compact_payload_fields(game, platform, snapshot, diff, max_part, attach_raw);
     if let Some(previous) = previous {
         fields.push((
             "Previous Hash".to_string(),
             format!("`{}`", short_hash(previous)),
+            true,
+        ));
+    }
+    if let Some(summary) = ai_summary.filter(|s| !s.trim().is_empty()) {
+        fields.push((
+            "💡 AI Technical Assessment".to_string(),
+            truncate(summary, MAX_FIELD_VALUE),
             false,
         ));
     }
@@ -428,6 +508,119 @@ pub fn build_update_embed_with_ai(
         &cache_footer(snapshot),
         2048,
     )))
+}
+
+/// Create an interactive button row for the update notification.
+pub fn build_update_action_row(
+    sha256: &str,
+    game_name: &str,
+    platform: &str,
+) -> CreateActionRow {
+    let btn_specs = CreateButton::new(format!("update:specs:{sha256}"))
+        .label("Technical Specs")
+        .emoji('🔍')
+        .style(ButtonStyle::Secondary);
+
+    let btn_devirt = CreateButton::new(format!(
+        "update:devirt:{}:{}",
+        crate::tracker::slug(game_name),
+        platform
+    ))
+    .label("Devirtualize")
+    .emoji('🔬')
+    .style(ButtonStyle::Primary);
+
+    CreateActionRow::Buttons(vec![btn_specs, btn_devirt])
+}
+
+/// Build a rich, full-fidelity technical specifications embed for ephemeral display.
+pub fn build_technical_specs_from_record(record: &Record) -> CreateEmbed {
+    let embed = CreateEmbed::new()
+        .title(format!("🔍 Technical Specifications · {} ({})", record.game, record.platform))
+        .colour(0x5865F2)
+        .timestamp(Timestamp::from_unix_timestamp(record.seen_at as i64).unwrap_or_else(|_| Timestamp::now()));
+
+    let mut fields: Vec<Field> = Vec::new();
+
+    // 1. Cryptographic Hashes
+    let hash_lines = vec![
+        format!("• **SHA-256**: `{}`", record.hashes.sha256),
+        format!("• **SHA-1**: `{}`", record.hashes.sha1),
+        format!("• **MD5**: `{}`", record.hashes.md5),
+    ];
+    fields.push(("Cryptographic Hashes".to_string(), hash_lines.join("\n"), false));
+
+    // 2. Binary Telemetry & Fuzzy Hash
+    let mut telemetry_lines = vec![
+        format!("• **Payload Size**: {} ({} bytes)", human_bytes(record.size), record.size),
+        format!("• **Container Format**: `{}`", record.format),
+        format!("• **Shannon Entropy**: `{:.2}` / 8.00", record.entropy),
+    ];
+    if let Some(tlsh) = &record.tlsh {
+        telemetry_lines.push(format!("• **TLSH Fuzzy Hash**: `{tlsh}`"));
+    }
+    if let Some(prev) = &record.previous_sha256 {
+        telemetry_lines.push(format!("• **Replaced Hash**: `{prev}`"));
+    }
+    fields.push(("Payload Telemetry".to_string(), telemetry_lines.join("\n"), false));
+
+    // 3. PE Detail (if available)
+    if let Some(pe) = &record.pe {
+        let mut pe_lines = vec![
+            format!("• **Architecture**: `{}` ({})", pe.machine, if pe.is_dll { "DLL" } else { "EXE" }),
+            format!("• **Linker Timestamp**: <t:{}:f> (<t:{}:R>)", pe.timestamp, pe.timestamp),
+        ];
+        if let Some(subsystem) = pe.subsystem {
+            pe_lines.push(format!("• **Subsystem**: `{subsystem}`"));
+        }
+        if pe.export_count > 0 {
+            pe_lines.push(format!("• **Export Count**: {}", pe.export_count));
+        }
+        if let Some(pdb) = &pe.pdb_path {
+            pe_lines.push(format!("• **PDB Path**: `{}`", truncate(pdb, 250)));
+        }
+        fields.push(("PE Architecture & Build".to_string(), pe_lines.join("\n"), false));
+
+        if let Some(sig) = &pe.signature {
+            fields.push(signature_field(sig));
+        }
+
+        if !pe.sections.is_empty() {
+            let sec_lines: Vec<String> = pe.sections.iter().take(12).map(|s| {
+                format!("`{:<8} {:>9}  entropy {:.2}`", s.name, human_bytes(s.raw_size as u64), s.entropy)
+            }).collect();
+            fields.push(("PE Sections".to_string(), join_capped(sec_lines), false));
+        }
+
+        if !pe.libraries.is_empty() {
+            let lib_str = pe.libraries.iter().take(15).cloned().collect::<Vec<_>>().join(", ");
+            fields.push(("Imported DLLs".to_string(), truncate(&lib_str, MAX_FIELD_VALUE), false));
+        }
+    }
+
+    // 4. Carved modules (if any)
+    if !record.modules.is_empty() {
+        let mod_lines: Vec<String> = record.modules.iter().take(8).map(|m| {
+            let arch_tag = m.arch.as_deref().map(|a| format!(" ({a})")).unwrap_or_default();
+            let size_tag = m.size.map(human_bytes).unwrap_or_else(|| "unknown size".to_string());
+            format!("• **{}{}**: `{}`", m.name, arch_tag, size_tag)
+        }).collect();
+        fields.push(("Carved Modules".to_string(), mod_lines.join("\n"), false));
+    }
+
+    // 5. CDN Headers & Validators
+    let mut cdn_lines = Vec::new();
+    if let Some(etag) = record.headers.get("etag") {
+        cdn_lines.push(format!("• **ETag**: `{etag}`"));
+    }
+    if let Some(lm) = record.headers.get("last-modified") {
+        cdn_lines.push(format!("• **Last-Modified**: `{lm}`"));
+    }
+    if !cdn_lines.is_empty() {
+        fields.push(("CDN Cache Validators".to_string(), cdn_lines.join("\n"), false));
+    }
+
+    apply(embed, fields).footer(CreateEmbedFooter::new(format!("CDN URL: {}", record.url)))
 }
 
 /// The embed returned by an on-demand `/eac check`, which reports the current
@@ -648,6 +841,54 @@ mod tests {
 
         assert!(fields.iter().all(|(n, _, _)| n != "MD5 / SHA-1"));
     }
+    #[test]
+    fn update_action_row_creates_specs_and_devirt_buttons() {
+        let row = build_update_action_row("d6d798c5613d325475ccc5d9fa15e83413f975820eb70c5894f7b61585996219", "Rust", "win64");
+        // Verify serializes cleanly and contains expected custom IDs
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("update:specs:d6d798c5613d325475ccc5d9fa15e83413f975820eb70c5894f7b61585996219"));
+        assert!(json.contains("update:devirt:rust:win64"));
+    }
+
+    #[test]
+    fn technical_specs_embed_renders_hashes_and_telemetry() {
+        use crate::archive::Record;
+        use crate::analysis::Hashes;
+        use std::collections::BTreeMap;
+
+        let record = Record {
+            seen_at: 1700000000,
+            game: "Rust".to_string(),
+            product_id: "prod_123".to_string(),
+            deployment_id: "dep_456".to_string(),
+            platform: "win64".to_string(),
+            url: "https://example.com/rust".to_string(),
+            size: 34500000,
+            hashes: Hashes {
+                sha256: "d6d798c5613d325475ccc5d9fa15e83413f975820eb70c5894f7b61585996219".to_string(),
+                sha1: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+                md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            },
+            tlsh: Some("T14777336650D05F9FAA3EF3EEBAB455C9A7E12B738CB255E43E12231C278189CDD050E4".to_string()),
+            format: "pe_container".to_string(),
+            entropy: 7.99,
+            headers: BTreeMap::from([
+                ("etag".to_string(), "\"2a8dff5d\"".to_string()),
+                ("last-modified".to_string(), "Thu, 17 Sep 2026 16:26:56 GMT".to_string()),
+            ]),
+            modules: vec![],
+            pe: None,
+            previous_sha256: Some("a7ad2b99692fe03f000000000000000000000000000000000000000000000000".to_string()),
+        };
+
+        let embed = build_technical_specs_from_record(&record);
+        let json = serde_json::to_string(&embed).unwrap();
+        assert!(json.contains("Technical Specifications"));
+        assert!(json.contains("d6d798c5613d325475ccc5d9fa15e83413f975820eb70c5894f7b61585996219"));
+        assert!(json.contains("T14777336650D05F9FAA3EF3EEBAB455C9A7E12B738CB255E43E12231C278189CDD050E4"));
+        assert!(json.contains("32.9 MB"));
+    }
+
 }
 
 /// Format diff metrics into clean text for AI prompt synthesis.
