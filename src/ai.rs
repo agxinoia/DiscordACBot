@@ -305,29 +305,32 @@ pub async fn devirtualize_analysis(
     decompiled_context: Option<&str>,
 ) -> Result<String> {
     let mut prompt = format!(
-        "Target Game: {game}\nPlatform: {platform}\nModule: {module_name}\n\n=== Static Protection & VM Heuristics ===\n{heuristic_report}\n"
+        "Target: {game} ({platform})\nBinary Module: {module_name}\n\nStatic Protection Scan:\n{heuristic_report}\n"
     );
 
     if let Some(extra) = decompiled_context.filter(|s| !s.trim().is_empty()) {
-        let bounded_extra = if extra.len() > 10_000 {
-            let end = extra.char_indices().map(|(i, _)| i).take_while(|i| *i < 10_000).last().unwrap_or(extra.len());
+        let bounded_extra = if extra.len() > 6_000 {
+            let end = extra.char_indices().map(|(i, _)| i).take_while(|i| *i < 6_000).last().unwrap_or(extra.len());
             &extra[..end]
         } else {
             extra
         };
         prompt.push_str(&format!(
-            "\n=== Extracted Decompiled Functions & Dispatcher Bodies ===\n{bounded_extra}\n"
+            "\nExtracted Code / Dispatcher Snippets:\n{bounded_extra}\n"
         ));
     }
 
     prompt.push_str(
-        "\nProvide a comprehensive reverse-engineering report structured as follows:\n         1. **Protection & VM Architecture Identification**: Identify the virtualizer (EAC custom VM, VMProtect, Themida, etc.), describe dispatcher loop structure, virtual program counter (VPC), and virtual registers.\n         2. **Bytecode Handler Analysis**: Analyze candidate bytecode handlers, decode opcode semantics (arithmetic, memory access, stack ops, control flow jumps).\n         3. **Devirtualized High-Level Reconstruction**: Provide clean, reconstructed C pseudo-code recovering the original pre-virtualized logic.\n         4. **Anti-Analysis & Security Insights**: Note any integrity checks, timing detections (RDTSC), or anti-tamper mechanisms present."
+        "\nProvide a concise technical defensive assessment of this binary:\n\
+         1. **Protection & Obfuscation Analysis**: Assess whether custom VMs, packers, or control-flow obfuscation are present.\n\
+         2. **Architectural & Toolchain Characteristics**: Note compiler runtime (MSVC, Unity, etc.), section layout, and symbols.\n\
+         3. **Reverse-Engineering Posture**: Highlight integrity verification and anti-analysis characteristics in 3-4 concise points."
     );
 
     let messages = vec![
         ChatMessage {
             role: "system",
-            content: "You are an elite software security researcher and expert in binary devirtualization,                       symbolic execution, and virtual machine-based code protection analysis.                       Analyze the supplied disassembly, decompiled Ghidra snippets, and static heuristics                       to provide a rigorous, actionable devirtualization and native logic recovery report.",
+            content: "You are a software security researcher analyzing binary protection mechanisms, anti-tamper implementations, and compiler toolchain layout for defensive security research.",
         },
         ChatMessage {
             role: "user",
@@ -335,7 +338,7 @@ pub async fn devirtualize_analysis(
         },
     ];
 
-    chat_completion(api_key, model, delay_ms, messages, 0.3, 2048).await
+    chat_completion(api_key, model, delay_ms, messages, 0.2, 1536).await
 }
 
 #[cfg(test)]

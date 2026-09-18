@@ -199,7 +199,8 @@ pub async fn run_devirtualization_pipeline(
     if cache_file.exists() {
         if let Ok(content) = tokio::fs::read_to_string(&cache_file).await {
             if let Ok(mut cached) = serde_json::from_str::<DevirtResult>(&content) {
-                if cached.ai_analysis.is_some() || nvidia_key.is_none() {
+                let is_error = cached.ai_analysis.as_ref().map(|s| s.starts_with("AI synthesis request failed")).unwrap_or(false);
+                if (!is_error && cached.ai_analysis.is_some()) || nvidia_key.is_none() {
                     cached.game = game.to_string();
                     cached.platform = platform.to_string();
                     return Ok(cached);
@@ -222,7 +223,19 @@ pub async fn run_devirtualization_pipeline(
     // Step 3: NVIDIA NIM AI Devirtualization synthesis
     let mut ai_analysis = None;
     if let Some(key) = nvidia_key.filter(|k| !k.trim().is_empty()) {
-        let heuristic_str = format!("{:#?}", protection);
+        let mut heuristic_lines = Vec::new();
+        heuristic_lines.push(format!("Architecture: {}", protection.architecture));
+        heuristic_lines.push(format!("Suspected Protector: {}", protection.suspected_protector.as_deref().unwrap_or("None detected")));
+        heuristic_lines.push(format!("Control Flow Flattening: {}", if protection.has_control_flow_flattening { "Detected" } else { "None" }));
+        heuristic_lines.push(format!("Summary: {}", protection.summary));
+        if !protection.suspicious_sections.is_empty() {
+            heuristic_lines.push("Suspicious Sections:".to_string());
+            for s in &protection.suspicious_sections {
+                heuristic_lines.push(format!(" - {} (entropy: {:.2}, raw: {} bytes)", s.name, s.entropy, s.raw_size));
+            }
+        }
+        let heuristic_str = heuristic_lines.join("\n");
+
         match crate::ai::devirtualize_analysis(
             key,
             ai_model,
@@ -250,9 +263,12 @@ pub async fn run_devirtualization_pipeline(
         ai_analysis,
     };
 
-    if let Ok(serialized) = serde_json::to_string_pretty(&result) {
-        let _ = tokio::fs::create_dir_all(&cache_dir).await;
-        let _ = tokio::fs::write(&cache_file, serialized).await;
+    let is_error = result.ai_analysis.as_ref().map(|s| s.starts_with("AI synthesis request failed")).unwrap_or(false);
+    if !is_error && result.ai_analysis.is_some() {
+        if let Ok(serialized) = serde_json::to_string_pretty(&result) {
+            let _ = tokio::fs::create_dir_all(&cache_dir).await;
+            let _ = tokio::fs::write(&cache_file, serialized).await;
+        }
     }
 
     Ok(result)
