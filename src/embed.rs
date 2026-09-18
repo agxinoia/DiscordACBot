@@ -649,3 +649,37 @@ mod tests {
         assert!(fields.iter().all(|(n, _, _)| n != "MD5 / SHA-1"));
     }
 }
+
+/// Format diff metrics into clean text for AI prompt synthesis.
+pub fn format_diff_for_ai(diff: &Diff, prev_hash: Option<&str>, new_hash: &str) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("New SHA-256: {new_hash}"));
+    if let Some(prev) = prev_hash {
+        lines.push(format!("Previous SHA-256: {prev}"));
+    }
+    lines.push(format!("Payload Size Delta: {}", signed_bytes(diff.size_delta)));
+    if let Some(distance) = diff.tlsh_distance {
+        lines.push(format!(
+            "TLSH Fuzzy Distance: {distance} ({})",
+            tlsh_verdict(distance)
+        ));
+    }
+    if !diff.added.is_empty() {
+        lines.push(format!("Added Modules: {}", diff.added.join(", ")));
+    }
+    if !diff.removed.is_empty() {
+        lines.push(format!("Removed Modules: {}", diff.removed.join(", ")));
+    }
+    if !diff.changed.is_empty() {
+        let changed_parts: Vec<String> = diff
+            .changed
+            .iter()
+            .map(|c| match c.size_delta() {
+                Some(d) => format!("{} ({})", c.name, signed_bytes(d)),
+                None => c.name.clone(),
+            })
+            .collect();
+        lines.push(format!("Changed Modules: {}", changed_parts.join(", ")));
+    }
+    lines.join("\n")
+}

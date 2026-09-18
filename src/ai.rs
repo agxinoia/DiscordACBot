@@ -123,6 +123,8 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessageResponse {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -145,7 +147,7 @@ pub async fn chat_completion(
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(180))
         .build()
         .context("building reqwest client")?;
 
@@ -228,7 +230,10 @@ pub async fn chat_completion(
         let content = parsed
             .choices
             .into_iter()
-            .find_map(|c| c.message.content)
+            .find_map(|c| {
+                c.message.content.filter(|s| !s.trim().is_empty())
+                    .or(c.message.reasoning_content.filter(|s| !s.trim().is_empty()))
+            })
             .context("no content returned in choice")?;
 
         return Ok(content.trim().to_string());
@@ -275,8 +280,9 @@ pub async fn summarize_diff(
             content: "You are a senior reverse engineering and binary analysis assistant. \
                       Given information about updated binary modules (such as size deltas, \
                       fuzzy hash distances, exported symbols, or decompiled snippets), provide \
-                      a crisp, professional technical summary of the changes. \
-                      Highlight what moved, likely architectural changes, and any notable patterns.",
+                      a crisp, direct, technical summary of the changes in 2-3 focused sentences. \
+                      Highlight what moved, likely architectural/toolchain changes (e.g. full rebuilds, \
+                      compiler/engine upgrades, dead-code elimination), and the practical impact on reverse engineering.",
         },
         ChatMessage {
             role: "user",
@@ -284,7 +290,7 @@ pub async fn summarize_diff(
         },
     ];
 
-    chat_completion(api_key, model, delay_ms, messages, 0.2, 512).await
+    chat_completion(api_key, model, delay_ms, messages, 0.4, 1536).await
 }
 
 /// Request specialized AI devirtualization and reverse-engineering analysis.
@@ -329,7 +335,7 @@ pub async fn devirtualize_analysis(
         },
     ];
 
-    chat_completion(api_key, model, delay_ms, messages, 0.2, 1024).await
+    chat_completion(api_key, model, delay_ms, messages, 0.3, 2048).await
 }
 
 #[cfg(test)]

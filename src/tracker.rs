@@ -319,19 +319,38 @@ impl Tracker {
                 let model = settings::effective_ai_model(&guild_settings, &self.config);
                 let delay = settings::effective_ai_delay_ms(&guild_settings, &self.config);
 
-                let diff_text = format!("{:?}", outcome.diff);
-                let ghidra_summary = if let Some(archive) = self.archive.as_ref() {
-                    let binary_path = archive.blob_path(&outcome.snapshot.hashes.sha256);
-                    if binary_path.exists() {
-                        let ghidra_bin = crate::ghidra::find_ghidra(self.config.ai.ghidra_path.as_deref());
-                        let analysis = crate::ghidra::analyze_binary(
+                let diff_text = crate::embed::format_diff_for_ai(
+                    outcome.diff.as_ref().unwrap(),
+                    outcome.previous.as_deref(),
+                    &outcome.snapshot.hashes.sha256,
+                );
+
+                let binary_path = self.archive.as_ref().map(|a| a.blob_path(&outcome.snapshot.hashes.sha256));
+                let decompilation_context = if let Some(path) = binary_path.as_ref().filter(|p| p.exists()) {
+                    let mut ctx_parts = Vec::new();
+
+                    if let Ok(bytes) = std::fs::read(path) {
+                        let scan = crate::devirtualize::scan_pe_for_vm(&bytes);
+                        if scan.suspected_protector.is_some() || !scan.suspicious_sections.is_empty() || !scan.vm_candidates.is_empty() {
+                            ctx_parts.push(scan.summary);
+                        }
+                    }
+
+                    let ghidra_bin = crate::ghidra::find_ghidra(self.config.ai.ghidra_path.as_deref());
+                    if let Some(root) = self.archive.as_ref().map(|a| a.root()) {
+                        if let Ok(analysis) = crate::ghidra::analyze_binary(
                             ghidra_bin.as_deref(),
-                            &binary_path,
-                            archive.root(),
-                        ).await.ok();
-                        analysis.map(|a| a.summary_text)
-                    } else {
+                            path,
+                            root,
+                        ).await {
+                            ctx_parts.push(analysis.summary_text);
+                        }
+                    }
+
+                    if ctx_parts.is_empty() {
                         None
+                    } else {
+                        Some(ctx_parts.join("\n\n"))
                     }
                 } else {
                     None
@@ -344,7 +363,7 @@ impl Tracker {
                     &game.name,
                     platform,
                     &diff_text,
-                    ghidra_summary.as_deref(),
+                    decompilation_context.as_deref(),
                 ).await {
                     Ok(summary) => {
                         ai_summary = Some(summary);
